@@ -10,7 +10,7 @@
 # ============================================================
 # Stage 1: Build Rust prover (CPU-only, no Metal)
 # ============================================================
-FROM rust:1.78-slim AS rust-builder
+FROM rust:1.85-slim AS rust-builder
 
 WORKDIR /build
 

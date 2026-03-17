@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Rust
+target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Benchmark outputs
+python/benchmark/results_*.json
+
+# Model artifacts
+*.pt
+*.onnx
+*.srs
+*.bin
+!rust/**/src/*.rs
+
+# ZK proof artifacts
+*.proof
+circuit.bin
+circuit.json
+
+# Claude
+.claude/

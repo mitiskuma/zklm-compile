@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZK-Compile — Verified Chat</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface2: #1a1a26;
+    --border: #2a2a3a;
+    --text: #e0e0e8;
+    --text-dim: #7a7a90;
+    --green: #4ade80;
+    --green-bg: rgba(74, 222, 128, 0.12);
+    --green-border: rgba(74, 222, 128, 0.3);
+    --red: #f87171;
+    --red-bg: rgba(248, 113, 113, 0.12);
+    --red-border: rgba(248, 113, 113, 0.3);
+    --accent: #4a9eff;
+    --orange: #fb923c;
+  }
+
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* --- Nav --- */
+  .nav {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 0 24px;
+    height: 44px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .nav-brand {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-right: 24px;
+  }
+  .nav-brand span { color: var(--green); }
+  .nav-link {
+    padding: 10px 16px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+  }
+  .nav-link:hover { color: var(--text); }
+  .nav-link.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  /* --- Layout --- */
+  .layout {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* --- Chat area --- */
+  .chat-area {
+    flex: 65;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border-right: 1px solid var(--border);
+  }
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .messages::-webkit-scrollbar { width: 6px; }
+  .messages::-webkit-scrollbar-track { background: transparent; }
+  .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .msg {
+    max-width: 75%;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .msg.user { align-self: flex-end; }
+  .msg.assistant { align-self: flex-start; }
+  .msg.system { align-self: center; }
+
+  .msg-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .msg.user .msg-label { text-align: right; justify-content: flex-end; }
+
+  .msg-bubble {
+    padding: 10px 14px;
+    border-radius: 10px;
+    font-size: 13px;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+  .msg.user .msg-bubble {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-bottom-right-radius: 3px;
+  }
+  .msg.assistant .msg-bubble {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-bottom-left-radius: 3px;
+  }
+  .msg.system .msg-bubble {
+    background: var(--red-bg);
+    border: 1px solid var(--red-border);
+    color: var(--red);
+    font-size: 11px;
+    padding: 8px 12px;
+    border-radius: 6px;
+  }
+
+  .lock-icon {
+    color: var(--green);
+    font-size: 12px;
+  }
+
+  /* --- Proved tokens --- */
+  .token-proved {
+    border-bottom: 1px solid var(--green);
+    cursor: default;
+    position: relative;
+  }
+  .token-invalid {
+    border-bottom: 1px solid var(--red);
+    cursor: default;
+  }
+
+  @keyframes token-flash {
+    0% { background: rgba(74, 222, 128, 0.3); }
+    100% { background: transparent; }
+  }
+  .token-flash {
+    animation: token-flash 0.5s ease-out;
+  }
+
+  @keyframes token-flash-red {
+    0% { background: rgba(248, 113, 113, 0.3); }
+    100% { background: transparent; }
+  }
+  .token-flash-red {
+    animation: token-flash-red 0.5s ease-out;
+  }
+
+  /* --- Tooltip --- */
+  .token-tooltip {
+    position: fixed;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 11px;
+    color: var(--text);
+    line-height: 1.4;
+    max-width: 320px;
+    pointer-events: none;
+    z-index: 100;
+    display: none;
+  }
+
+  /* --- Input bar --- */
+  .input-bar {
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .input-row {
+    display: flex;
+    gap: 8px;
+  }
+  #chat-input {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 10px 14px;
+    outline: none;
+  }
+  #chat-input:focus { border-color: var(--accent); }
+  #chat-input::placeholder { color: var(--text-dim); }
+
+  .btn-send {
+    background: var(--accent);
+    color: #000;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .btn-send:hover { opacity: 0.85; }
+  .btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-stop {
+    background: var(--red);
+    color: #000;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .btn-stop:hover { opacity: 0.85; }
+
+  .input-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 20px;
+    margin-top: 10px;
+    align-items: center;
+    font-size: 11px;
+    color: var(--text-dim);
+    position: relative;
+    z-index: 10;
+  }
+  .input-controls label { white-space: nowrap; }
+  .input-controls input[type="range"] { width: 100px; accent-color: var(--accent); }
+  .input-controls select {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 3px 8px;
+    outline: none;
+  }
+  .input-controls select:focus { border-color: var(--accent); }
+  .slider-val {
+    font-variant-numeric: tabular-nums;
+    min-width: 20px;
+    text-align: right;
+  }
+
+  /* --- Dashboard --- */
+  .dashboard {
+    flex: 35;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+    transition: flex 0.2s;
+  }
+  .dashboard.collapsed {
+    flex: 0 0 36px;
+  }
+
+  .dash-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    cursor: pointer;
+    user-select: none;
+  }
+  .dash-header h2 {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+  .dash-toggle {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 2px 6px;
+  }
+
+  .dash-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .dash-content::-webkit-scrollbar { width: 6px; }
+  .dash-content::-webkit-scrollbar-track { background: transparent; }
+  .dash-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .dashboard.collapsed .dash-content { display: none; }
+
+  /* --- Stats grid --- */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .stat-card .stat-label {
+    font-size: 9px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  .stat-card .stat-value {
+    font-size: 16px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-card .stat-value.green { color: var(--green); }
+
+  /* --- Token log --- */
+  .token-log-header {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .token-log {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 11px;
+    min-height: 100px;
+  }
+  .token-log::-webkit-scrollbar { width: 4px; }
+  .token-log::-webkit-scrollbar-track { background: transparent; }
+  .token-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .log-entry {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 8px;
+    background: var(--surface);
+    border-radius: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .log-status { flex-shrink: 0; }
+  .log-status.valid { color: var(--green); }
+  .log-status.invalid { color: var(--red); }
+  .log-status.pending { color: var(--orange); }
+  .log-token {
+    flex: 1;
+    min-width: 60px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+  }
+  .log-detail {
+    color: var(--text-dim);
+    font-size: 10px;
+    white-space: nowrap;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner-inline {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border: 1.5px solid var(--border);
+    border-top-color: var(--orange);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+  }
+
+  .empty-state {
+    color: var(--text-dim);
+    font-size: 11px;
+    text-align: center;
+    padding: 20px;
+  }
+
+  /* --- Warning banner --- */
+  .warning-banner {
+    background: var(--red-bg);
+    border: 1px solid var(--red-border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 11px;
+    color: var(--red);
+    display: none;
+  }
+
+  /* --- Message action buttons --- */
+  .msg-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .msg-action-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 10px;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .msg-action-btn:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  .msg-action-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .msg-action-btn.editing {
+    border-color: var(--orange);
+    color: var(--orange);
+  }
+
+  /* Editable tokens */
+  .token-editable {
+    outline: 1px dashed var(--orange);
+    outline-offset: 1px;
+    cursor: text;
+    border-radius: 2px;
+  }
+  .token-editable:focus {
+    outline-color: var(--accent);
+    background: rgba(74, 158, 255, 0.1);
+  }
+
+  /* Token match/mismatch indicators for retry */
+  .token-match {
+    border-bottom: 2px solid var(--green) !important;
+    background: var(--green-bg);
+  }
+  .token-mismatch {
+    border-bottom: 2px solid var(--red) !important;
+    background: var(--red-bg);
+  }
+
+  /* Retry result badge */
+  .retry-result {
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    margin-top: 4px;
+    display: inline-block;
+  }
+  .retry-result.all-match {
+    background: var(--green-bg);
+    border: 1px solid var(--green-border);
+    color: var(--green);
+  }
+  .retry-result.has-mismatch {
+    background: var(--red-bg);
+    border: 1px solid var(--red-border);
+    color: var(--red);
+  }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-brand">ZK-Compile <span>Verified ML</span></div>
+  <a href="chat.html" class="nav-link active">Chat</a>
+  <a href="index.html" class="nav-link">Playground</a>
+</nav>
+
+<div class="layout">
+  <!-- Chat area -->
+  <div class="chat-area">
+    <div class="messages" id="messages">
+      <div class="empty-state" id="empty-state">
+        Start a conversation. Every token is cryptographically proved via ZK proofs over M31.
+      </div>
+    </div>
+
+    <div class="input-bar">
+      <div class="input-row">
+        <input type="text" id="chat-input" placeholder="Type a message..." autocomplete="off">
+        <button class="btn-send" id="send-btn">Send</button>
+        <button class="btn-stop" id="stop-btn" style="display:none;">Stop</button>
+      </div>
+      <div class="input-controls">
+        <label>Model
+          <select id="cfg-model">
+            <option value="gpt2" selected>GPT-2 (124M)</option>
+            <option value="TinyLlama/TinyLlama-1.1B-Chat-v1.0">TinyLlama (1.1B)</option>
+            <option value="Qwen/Qwen3.5-0.8B">Qwen3.5 (0.8B)</option>
+            <option value="custom">Custom model...</option>
+          </select>
+        </label>
+        <input type="text" id="cfg-model-custom" placeholder="HuggingFace model name" style="display:none; background:var(--surface); border:1px solid var(--border); border-radius:4px; color:var(--text); font-family:inherit; font-size:11px; padding:3px 8px; width:200px;">
+        <label>Backend
+          <select id="cfg-backend">
+            <option value="cpu" selected>CPU (rayon)</option>
+            <option value="metal">Metal GPU</option>
+          </select>
+        </label>
+        <label>PCS Mode
+          <select id="cfg-pcs-mode">
+            <option value="default" selected>Default (92ms)</option>
+            <option value="pcs">Basefold w_partial (134ms)</option>
+            <option value="pcs-full">Basefold Full W (14.3s)</option>
+          </select>
+        </label>
+        <label id="label-layers">Layers <input type="range" id="cfg-layers" min="1" max="12" value="1"> <span class="slider-val" id="cfg-layers-val">1</span>/12</label>
+        <label>Max tokens <input type="range" id="cfg-max-tokens" min="1" max="100" value="50"> <span class="slider-val" id="cfg-max-tokens-val">50</span></label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Proof dashboard -->
+  <div class="dashboard" id="dashboard">
+    <div class="dash-header" onclick="toggleDashboard()">
+      <h2>Proof Dashboard</h2>
+      <button class="dash-toggle" id="dash-toggle-btn">&#9666;</button>
+    </div>
+    <div class="dash-content">
+      <div class="warning-banner" id="warning-banner"></div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Tokens</div>
+          <div class="stat-value" id="stat-tokens">0 / 0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Avg Prove</div>
+          <div class="stat-value" id="stat-avg-prove">--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Avg Verify</div>
+          <div class="stat-value" id="stat-avg-verify">--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Proof</div>
+          <div class="stat-value" id="stat-total-size">--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Coverage</div>
+          <div class="stat-value green" id="stat-coverage">--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Backend</div>
+          <div class="stat-value" id="stat-backend" style="font-size:12px;">CPU</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">PCS Mode</div>
+          <div class="stat-value" id="stat-pcs-mode" style="font-size:12px;">Default</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Soundness</div>
+          <div class="stat-value green" id="stat-soundness" style="font-size:12px;">124-bit</div>
+        </div>
+      </div>
+
+      <div class="token-log-header">Token Proof Log</div>
+      <div class="token-log" id="token-log">
+        <div class="empty-state">No tokens yet</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="token-tooltip" id="tooltip"></div>
+
+<script>
+const API = 'http://localhost:8042';
+
+// State
+let generating = false;
+let abortController = null;
+let maxTokens = 50;
+let proveLayers = 1;
+let selectedModel = 'gpt2';
+let selectedBackend = 'cpu';
+let selectedPcsMode = 'default';
+let tokenStats = [];
+let messageDataList = []; // {context, tokens[], contentSpan, label, bubble, msgEl}
+
+// Elements
+const messagesEl = document.getElementById('messages');
+const emptyState = document.getElementById('empty-state');
+const chatInput = document.getElementById('chat-input');
+const sendBtn = document.getElementById('send-btn');
+const stopBtn = document.getElementById('stop-btn');
+const tokenLog = document.getElementById('token-log');
+const tooltip = document.getElementById('tooltip');
+const warningBanner = document.getElementById('warning-banner');
+
+// Sliders
+const layersSlider = document.getElementById('cfg-layers');
+const layersVal = document.getElementById('cfg-layers-val');
+const maxTokSlider = document.getElementById('cfg-max-tokens');
+const maxTokVal = document.getElementById('cfg-max-tokens-val');
+
+layersSlider.addEventListener('input', () => {
+  proveLayers = parseInt(layersSlider.value);
+  layersVal.textContent = proveLayers;
+});
+maxTokSlider.addEventListener('input', () => {
+  maxTokens = parseInt(maxTokSlider.value);
+  maxTokVal.textContent = maxTokens;
+});
+
+// Model selector
+const modelSelect = document.getElementById('cfg-model');
+const modelCustom = document.getElementById('cfg-model-custom');
+
+// Backend selector
+const backendSelect = document.getElementById('cfg-backend');
+backendSelect.addEventListener('change', () => {
+  selectedBackend = backendSelect.value;
+  document.getElementById('stat-backend').textContent = selectedBackend === 'metal' ? 'Metal GPU' : 'CPU';
+});
+
+// PCS mode selector
+const pcsModeSelect = document.getElementById('cfg-pcs-mode');
+const PCS_LABELS = { 'default': 'Default', 'pcs': 'Basefold w_partial', 'pcs-full': 'Basefold Full W' };
+const PCS_SOUNDNESS = { 'default': '124-bit', 'pcs': '124+219-bit', 'pcs-full': '124+219-bit' };
+pcsModeSelect.addEventListener('change', () => {
+  selectedPcsMode = pcsModeSelect.value;
+  document.getElementById('stat-pcs-mode').textContent = PCS_LABELS[selectedPcsMode] || selectedPcsMode;
+  document.getElementById('stat-soundness').textContent = PCS_SOUNDNESS[selectedPcsMode] || '124-bit';
+});
+
+modelSelect.addEventListener('change', () => {
+  if (modelSelect.value === 'custom') {
+    modelCustom.style.display = '';
+    modelCustom.focus();
+    selectedModel = modelCustom.value || 'gpt2';
+  } else {
+    modelCustom.style.display = 'none';
+    selectedModel = modelSelect.value;
+  }
+  updateModelLabel();
+});
+modelCustom.addEventListener('input', () => {
+  selectedModel = modelCustom.value || 'gpt2';
+  updateModelLabel();
+});
+
+function getModelDisplayName() {
+  if (modelSelect.value !== 'custom') return modelSelect.options[modelSelect.selectedIndex].text;
+  return selectedModel.split('/').pop() || 'Custom';
+}
+
+function updateModelLabel() {
+  // Update layers slider max based on model type
+  const isGpt2 = selectedModel === 'gpt2';
+  const isQwen35 = selectedModel.toLowerCase().includes('qwen3.5') || selectedModel.toLowerCase().includes('qwen3_5');
+  const maxLayers = isGpt2 ? 12 : isQwen35 ? 24 : 32;
+  layersSlider.max = maxLayers;
+  document.getElementById('label-layers').innerHTML =
+    'Layers <input type="range" id="cfg-layers" min="1" max="' + maxLayers + '" value="' + proveLayers + '"> <span class="slider-val" id="cfg-layers-val">' + proveLayers + '</span>/' + maxLayers;
+  // Rebind slider
+  const newSlider = document.getElementById('cfg-layers');
+  newSlider.addEventListener('input', () => {
+    proveLayers = parseInt(newSlider.value);
+    document.getElementById('cfg-layers-val').textContent = proveLayers;
+  });
+}
+
+// Dashboard toggle
+function toggleDashboard() {
+  const dash = document.getElementById('dashboard');
+  const btn = document.getElementById('dash-toggle-btn');
+  dash.classList.toggle('collapsed');
+  btn.innerHTML = dash.classList.contains('collapsed') ? '&#9656;' : '&#9666;';
+}
+
+// Helpers
+function escHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function formatMs(ms) {
+  if (ms < 1) return ms.toFixed(2) + 'ms';
+  if (ms < 1000) return ms.toFixed(1) + 'ms';
+  return (ms / 1000).toFixed(2) + 's';
+}
+
+// Update dashboard stats
+function updateStats() {
+  const count = tokenStats.length;
+  document.getElementById('stat-tokens').textContent = count + ' / ' + maxTokens;
+
+  if (count === 0) {
+    document.getElementById('stat-avg-prove').textContent = '--';
+    document.getElementById('stat-avg-verify').textContent = '--';
+    document.getElementById('stat-total-size').textContent = '--';
+    document.getElementById('stat-coverage').textContent = '--';
+    return;
+  }
+
+  const avgProve = tokenStats.reduce((s, t) => s + t.prove_time_ms, 0) / count;
+  const avgVerify = tokenStats.reduce((s, t) => s + t.verify_time_ms, 0) / count;
+  const totalSize = tokenStats.reduce((s, t) => s + t.proof_size, 0);
+  const avgCoverage = tokenStats.reduce((s, t) => s + (t.total_pct || 100), 0) / count;
+
+  document.getElementById('stat-avg-prove').textContent = formatMs(avgProve) + '/tok';
+  document.getElementById('stat-avg-verify').textContent = formatMs(avgVerify) + '/tok';
+  document.getElementById('stat-total-size').textContent = formatBytes(totalSize);
+  document.getElementById('stat-coverage').textContent = avgCoverage.toFixed(0) + '%';
+}
+
+// Add log entry
+function addLogEntry(token, proof, pending) {
+  // Remove empty state
+  const empty = tokenLog.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+
+  if (pending) {
+    entry.innerHTML =
+      '<span class="log-status pending"><span class="spinner-inline"></span></span>' +
+      '<span class="log-token">proving...</span>' +
+      '<span class="log-detail"></span>';
+    entry.id = 'log-pending';
+  } else {
+    const valid = proof.status === 'VALID';
+    entry.innerHTML =
+      '<span class="log-status ' + (valid ? 'valid' : 'invalid') + '">' + (valid ? '\u2713' : '\u2717') + '</span>' +
+      '<span class="log-token">"' + escHtml(token) + '"</span>' +
+      '<span class="log-detail">' + formatMs(proof.prove_time_ms) + ' prove  ' + formatMs(proof.verify_time_ms) + ' verify  ' + formatBytes(proof.proof_size) + '</span>';
+  }
+
+  tokenLog.appendChild(entry);
+  tokenLog.scrollTop = tokenLog.scrollHeight;
+  return entry;
+}
+
+function removePendingLog() {
+  const el = document.getElementById('log-pending');
+  if (el) el.remove();
+}
+
+// Tooltip
+let tooltipTarget = null;
+
+document.addEventListener('mouseover', (e) => {
+  const span = e.target.closest('.token-proved, .token-invalid');
+  if (!span) return;
+  tooltipTarget = span;
+  const data = span.dataset;
+  let text;
+  if (span.classList.contains('token-proved')) {
+    const soundness = data.soundness ? ' Soundness: ' + data.soundness + '.' : '';
+    text = 'Proved via structured sumcheck over M31. ' + (data.ops || '?') + ' ops verified in ' + (data.proveMs || '?') + 'ms.' + soundness;
+  } else {
+    text = 'Proof INVALID for this token.';
+  }
+  tooltip.textContent = text;
+  tooltip.style.display = 'block';
+  positionTooltip(e);
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (tooltipTarget) positionTooltip(e);
+});
+
+document.addEventListener('mouseout', (e) => {
+  const span = e.target.closest('.token-proved, .token-invalid');
+  if (span) {
+    tooltip.style.display = 'none';
+    tooltipTarget = null;
+  }
+});
+
+function positionTooltip(e) {
+  const x = Math.min(e.clientX + 12, window.innerWidth - 340);
+  const y = e.clientY + 16;
+  tooltip.style.left = x + 'px';
+  tooltip.style.top = y + 'px';
+}
+
+// Create message bubble
+function createMessage(role, labelText) {
+  if (emptyState) emptyState.remove();
+
+  const msg = document.createElement('div');
+  msg.className = 'msg ' + role;
+
+  const label = document.createElement('div');
+  label.className = 'msg-label';
+  label.textContent = labelText;
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+
+  msg.appendChild(label);
+  msg.appendChild(bubble);
+  messagesEl.appendChild(msg);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  return { msg, label, bubble };
+}
+
+function addSystemError(text) {
+  const { bubble } = createMessage('system', '');
+  bubble.textContent = text;
+}
+
+// --- Edit & Retry ---
+
+function addMessageActions(msgEl, msgIndex) {
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+
+  const editBtn = document.createElement('button');
+  editBtn.className = 'msg-action-btn';
+  editBtn.textContent = 'Edit';
+  editBtn.onclick = () => toggleEdit(msgIndex, editBtn);
+
+  const retryBtn = document.createElement('button');
+  retryBtn.className = 'msg-action-btn';
+  retryBtn.textContent = 'Retry prove';
+  retryBtn.onclick = () => retryProve(msgIndex, retryBtn);
+
+  actions.appendChild(editBtn);
+  actions.appendChild(retryBtn);
+  msgEl.appendChild(actions);
+}
+
+function toggleEdit(msgIndex, btn) {
+  const msgData = messageDataList[msgIndex];
+  if (!msgData) return;
+  const spans = msgData.contentSpan.querySelectorAll('span[data-token-idx]');
+  const isEditing = btn.classList.contains('editing');
+
+  if (isEditing) {
+    // Exit edit mode
+    btn.classList.remove('editing');
+    btn.textContent = 'Edit';
+    spans.forEach(sp => {
+      sp.contentEditable = 'false';
+      sp.classList.remove('token-editable');
+      // Update stored token text
+      const idx = parseInt(sp.dataset.tokenIdx);
+      msgData.tokens[idx] = sp.textContent;
+    });
+  } else {
+    // Enter edit mode
+    btn.classList.add('editing');
+    btn.textContent = 'Done';
+    spans.forEach(sp => {
+      sp.contentEditable = 'true';
+      sp.classList.add('token-editable');
+      // Remove previous retry styling
+      sp.classList.remove('token-match', 'token-mismatch');
+    });
+    // Remove old retry result badge
+    const old = msgData.msgEl.querySelector('.retry-result');
+    if (old) old.remove();
+  }
+}
+
+async function retryProve(msgIndex, btn) {
+  const msgData = messageDataList[msgIndex];
+  if (!msgData || generating) return;
+
+  // Read current token texts from spans (may have been edited)
+  const spans = msgData.contentSpan.querySelectorAll('span[data-token-idx]');
+  const currentTokens = [];
+  spans.forEach(sp => {
+    const idx = parseInt(sp.dataset.tokenIdx);
+    msgData.tokens[idx] = sp.textContent;
+    currentTokens.push(sp.textContent);
+  });
+
+  // Exit edit mode if active
+  const editBtn = msgData.msgEl.querySelector('.msg-action-btn.editing');
+  if (editBtn) toggleEdit(msgIndex, editBtn);
+
+  generating = true;
+  btn.disabled = true;
+  btn.textContent = 'Proving...';
+  sendBtn.disabled = true;
+
+  // Reset dashboard for retry
+  tokenStats = [];
+  warningBanner.style.display = 'none';
+  tokenLog.innerHTML = '<div class="empty-state">No tokens yet</div>';
+  updateStats();
+
+  // Clear previous styles
+  spans.forEach(sp => {
+    sp.classList.remove('token-match', 'token-mismatch', 'token-proved', 'token-invalid');
+    sp.style.borderBottom = '';
+  });
+  const oldBadge = msgData.msgEl.querySelector('.retry-result');
+  if (oldBadge) oldBadge.remove();
+
+  // Remove old lock
+  const oldLock = msgData.label.querySelector('.lock-icon');
+  if (oldLock) oldLock.remove();
+
+  addLogEntry(null, null, true);
+
+  try {
+    const response = await fetch(API + '/verify-tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        context: msgData.context,
+        tokens: currentTokens,
+        prove_layers: proveLayers,
+        model: selectedModel,
+        backend: selectedBackend,
+        pcs_mode: selectedPcsMode
+      })
+    });
+
+    if (!response.ok) throw new Error('Server returned ' + response.status);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let allMatch = true;
+    let allValid = true;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop();
+
+      for (const part of parts) {
+        if (!part.startsWith('data: ')) continue;
+        const jsonStr = part.slice(6).trim();
+        if (!jsonStr) continue;
+
+        let json;
+        try { json = JSON.parse(jsonStr); } catch { continue; }
+
+        if (json.type === 'token') {
+          removePendingLog();
+          const idx = json.index;
+          const span = spans[idx];
+          const proof = json.proof || {};
+          const valid = proof.status === 'VALID';
+          const matches = json.matches;
+
+          if (!matches) allMatch = false;
+          if (!valid) allValid = false;
+
+          if (span) {
+            span.className = matches ? 'token-match' : 'token-mismatch';
+            span.classList.add(valid ? 'token-flash' : 'token-flash-red');
+            span.dataset.ops = proof.ops_proved || '?';
+            span.dataset.proveMs = proof.prove_time_ms ? proof.prove_time_ms.toFixed(1) : '?';
+            // Add tooltip data about match
+            if (!matches) {
+              span.title = 'MISMATCH: GPT-2 predicted "' + json.predicted_token + '" but token is "' + json.claimed_token + '"';
+            } else {
+              span.title = '';
+              span.classList.add('token-proved');
+            }
+            setTimeout(() => span.classList.remove('token-flash', 'token-flash-red'), 500);
+          }
+
+          tokenStats.push({
+            prove_time_ms: proof.prove_time_ms || 0,
+            verify_time_ms: proof.verify_time_ms || 0,
+            proof_size: proof.proof_size || 0,
+            total_pct: 100
+          });
+          updateStats();
+
+          const logToken = (matches ? '' : '\u2260 ') + json.claimed_token + (matches ? '' : ' (expected: ' + json.predicted_token + ')');
+          addLogEntry(logToken, proof, false);
+          if (idx < currentTokens.length - 1) addLogEntry(null, null, true);
+
+          if (!matches) {
+            warningBanner.textContent = 'Token #' + (idx + 1) + ': GPT-2 predicted "' + json.predicted_token + '" but got "' + json.claimed_token + '"';
+            warningBanner.style.display = 'block';
+          }
+
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+
+        } else if (json.type === 'done') {
+          removePendingLog();
+
+          const badge = document.createElement('div');
+          badge.className = 'retry-result ' + (json.all_match ? 'all-match' : 'has-mismatch');
+          badge.textContent = json.all_match
+            ? '\u2713 All ' + json.total_tokens + ' tokens match GPT-2 prediction'
+            : '\u2717 ' + json.total_tokens + ' tokens verified — some mismatches detected';
+          // Insert after bubble, before actions
+          const actionsEl = msgData.msgEl.querySelector('.msg-actions');
+          msgData.msgEl.insertBefore(badge, actionsEl);
+
+          if (json.all_match && json.all_valid) {
+            const lock = document.createElement('span');
+            lock.className = 'lock-icon';
+            lock.textContent = ' \uD83D\uDD12';
+            msgData.label.appendChild(lock);
+          }
+        }
+      }
+    }
+    removePendingLog();
+
+  } catch (err) {
+    removePendingLog();
+    addSystemError('Retry error: ' + err.message);
+  }
+
+  generating = false;
+  btn.disabled = false;
+  btn.textContent = 'Retry prove';
+  sendBtn.disabled = false;
+}
+
+// Stop generation
+function stopGeneration() {
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
+}
+
+// Send message
+async function sendMessage() {
+  const text = chatInput.value.trim();
+  if (!text || generating) return;
+
+  generating = true;
+  abortController = new AbortController();
+  sendBtn.disabled = true;
+  sendBtn.style.display = 'none';
+  stopBtn.style.display = '';
+  chatInput.value = '';
+
+  // Reset per-response state
+  tokenStats = [];
+  warningBanner.style.display = 'none';
+  tokenLog.innerHTML = '<div class="empty-state">No tokens yet</div>';
+  updateStats();
+
+  // User bubble
+  createMessage('user', 'You');
+  messagesEl.querySelector('.msg.user:last-child .msg-bubble').textContent = text;
+
+  // Assistant bubble
+  const backendTag = selectedBackend === 'metal' ? ' · Metal GPU' : ' · CPU';
+  const pcsTag = selectedPcsMode !== 'default' ? ' · ' + (PCS_LABELS[selectedPcsMode] || selectedPcsMode) : '';
+  const { msg: assistMsg, label: assistLabel, bubble: assistBubble } = createMessage('assistant', getModelDisplayName() + ' (verified' + backendTag + pcsTag + ')');
+  const contentSpan = document.createElement('span');
+  assistBubble.appendChild(contentSpan);
+
+  // Track message data for edit/retry
+  const msgIndex = messageDataList.length;
+  const msgData = { context: text, tokens: [], contentSpan, label: assistLabel, bubble: assistBubble, msgEl: assistMsg };
+  messageDataList.push(msgData);
+  let tokenIdx = 0;
+
+  // Show pending log
+  addLogEntry(null, null, true);
+
+  try {
+    const response = await fetch(API + '/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: text }],
+        max_tokens: maxTokens,
+        prove_layers: proveLayers,
+        model: selectedModel,
+        backend: selectedBackend,
+        pcs_mode: selectedPcsMode
+      }),
+      signal: abortController.signal
+    });
+
+    if (!response.ok) {
+      throw new Error('Server returned ' + response.status);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let allValid = true;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop();
+
+      for (const part of parts) {
+        if (!part.startsWith('data: ')) continue;
+        const jsonStr = part.slice(6).trim();
+        if (!jsonStr || jsonStr === '[DONE]') continue;
+
+        let json;
+        try { json = JSON.parse(jsonStr); } catch { continue; }
+
+        if (json.type === 'token') {
+          removePendingLog();
+
+          const proof = json.proof || {};
+          const valid = proof.status === 'VALID';
+          if (!valid) allValid = false;
+
+          // Create token span
+          const tokenSpan = document.createElement('span');
+          tokenSpan.textContent = json.token;
+          tokenSpan.className = (valid ? 'token-proved' : 'token-invalid') + ' ' + (valid ? 'token-flash' : 'token-flash-red');
+          tokenSpan.dataset.ops = proof.ops_proved || '?';
+          tokenSpan.dataset.proveMs = proof.prove_time_ms ? proof.prove_time_ms.toFixed(1) : '?';
+          tokenSpan.dataset.soundness = proof.soundness || PCS_SOUNDNESS[selectedPcsMode] || '124-bit';
+          tokenSpan.dataset.tokenIdx = tokenIdx;
+          contentSpan.appendChild(tokenSpan);
+          msgData.tokens.push(json.token);
+          tokenIdx++;
+
+          // Remove flash class after animation
+          setTimeout(() => {
+            tokenSpan.classList.remove('token-flash', 'token-flash-red');
+          }, 500);
+
+          // Track stats
+          tokenStats.push({
+            prove_time_ms: proof.prove_time_ms || 0,
+            verify_time_ms: proof.verify_time_ms || 0,
+            proof_size: proof.proof_size || 0,
+            total_pct: proof.total_pct || 100
+          });
+          updateStats();
+
+          // Log entry
+          addLogEntry(json.token, proof, false);
+
+          // Show pending for next token
+          addLogEntry(null, null, true);
+
+          // Warning for invalid
+          if (!valid) {
+            warningBanner.textContent = 'Warning: token "' + json.token + '" failed proof verification (status: ' + proof.status + ')';
+            warningBanner.style.display = 'block';
+          }
+
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+
+        } else if (json.type === 'done') {
+          removePendingLog();
+
+          // Lock icon
+          if (json.all_valid) {
+            const lock = document.createElement('span');
+            lock.className = 'lock-icon';
+            lock.textContent = ' \uD83D\uDD12';
+            assistLabel.appendChild(lock);
+          }
+
+          // Add edit & retry buttons
+          addMessageActions(assistMsg, msgIndex);
+        }
+      }
+    }
+
+    // Clean up any remaining pending
+    removePendingLog();
+
+  } catch (err) {
+    removePendingLog();
+    if (err.name !== 'AbortError') {
+      addSystemError('Error: ' + err.message);
+    }
+    // Add edit & retry buttons even on abort (partial response)
+    if (contentSpan.childNodes.length > 0) {
+      addMessageActions(assistMsg, msgIndex);
+    }
+  }
+
+  generating = false;
+  abortController = null;
+  sendBtn.disabled = false;
+  sendBtn.style.display = '';
+  stopBtn.style.display = 'none';
+  chatInput.focus();
+}
+
+// Events
+sendBtn.addEventListener('click', sendMessage);
+stopBtn.addEventListener('click', stopGeneration);
+chatInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+chatInput.focus();
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+[build]
+# NOTE: target-cpu=native produces binaries optimized for this specific CPU (M4 Max).
+# These binaries are NOT portable to other machines with different CPU features.
+# For portable/distributable builds, use: RUSTFLAGS="-C target-cpu=generic" cargo build --release
+rustflags = ["-C", "target-cpu=native"]

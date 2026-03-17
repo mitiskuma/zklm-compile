@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zk-ml-audit"
+version = "0.1.0"
+description = "Lightweight verification and auditing tool for ZK-Compile proofs"
+license = {text = "MIT OR Apache-2.0"}
+requires-python = ">=3.9"
+authors = [{name = "mitiskuma"}]
+keywords = ["zero-knowledge", "zk", "verification", "audit", "machine-learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Topic :: Security :: Cryptography",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+model = ["torch>=2.0", "transformers>=4.30"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+zk-audit = "zk_ml_audit.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zk_ml_audit"]

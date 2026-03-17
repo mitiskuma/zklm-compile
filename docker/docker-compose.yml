@@ -1,0 +1,19 @@
+services:
+  zk-ml-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8042:8042"
+    environment:
+      - HF_HOME=/models
+    volumes:
+      - hf-cache:/models
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

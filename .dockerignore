@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Python virtual environments and caches
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+*.egg-info
+
+# Rust build artifacts (rebuilt inside Docker)
+rust/*/target
+
+# macOS artifacts (Metal shaders, DS_Store)
+*.metallib
+*.air
+.DS_Store
+
+# Proof artifacts
+*.proof
+/tmp/
+
+# IDE and editor files
+.idea
+.vscode
+*.swp
+*.swo
+
+# Memory and docs (not needed at runtime)
+memory/
+*.md

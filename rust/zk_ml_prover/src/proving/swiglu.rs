@@ -186,7 +186,7 @@ mod tests {
         LookupTable {
             name: "silu_small".to_string(),
             entries,
-            commitment: WeightCommitment { root: [0u8; 32], num_weights: 256, log_height: 8 },
+            commitment: WeightCommitment { root: [0u8; 32], num_weights: 256, log_height: 8, kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast },
         }
     }
 

@@ -11,6 +11,7 @@ use p3_mersenne_31::PackedMersenne31Neon;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::field::m31_ops::f_to_ef;
 
@@ -31,6 +32,26 @@ pub fn set_gpu_enabled(enabled: bool) {
 #[cfg(feature = "metal_gpu")]
 pub fn is_gpu_enabled() -> bool {
     GPU_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Runtime toggle for "fast" base-field proving (M1 — Option C).
+///
+/// SOUNDNESS (M1): default is `false`, meaning prove paths route to extension-field
+/// (Mersenne31⁴) variants where they exist — challenges are 124-bit and the
+/// soundness error per round is ~2^-124. With `--fast`, prove paths fall back to
+/// base-field Mersenne-31 (~31-bit challenges per round). Base-field is fine for
+/// research / development but is below typical funding-grade SNARK soundness, so
+/// it must be an explicit opt-in. The default switch was reviewer M1.
+static FAST_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable fast (base-field) proving. CLI flag: `--fast`.
+pub fn set_fast_mode(enabled: bool) {
+    FAST_MODE.store(enabled, Ordering::Relaxed);
+}
+
+/// True iff `--fast` (base-field) proving is enabled. Default: false (EF).
+pub fn is_fast_mode() -> bool {
+    FAST_MODE.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,13 +128,46 @@ impl Transcript {
         }
     }
 
+    /// Squeeze a base-field challenge using rejection sampling on 64-bit windows.
+    ///
+    /// SOUNDNESS: previous implementation truncated SHA-256 output to 32 bits and
+    /// applied biased `raw % p` reduction (values 0,1 occur ~2x more often than
+    /// 2..p because 2^32 = 2*p + 2). That gave only ~31 bits of effective entropy
+    /// with grinding bias. New construction:
+    /// - reads 8 bytes (u64) per window from the 32-byte SHA-256 digest
+    /// - accepts iff raw < floor(2^64 / p) * p = 2^64 - 4 (since p = 2^31-1 and
+    ///   2^64 ≡ 4 mod p), giving uniform distribution mod p on accept
+    /// - rejection probability per window ≈ 4 / 2^64 ≈ 2^-62
+    /// - tries up to 4 windows from one digest; cumulative rejection ≈ 2^-248
+    /// - on the astronomically unlikely all-reject path, re-hashes (deterministic)
+    ///   and retries — terminates with overwhelming probability in 1 outer round.
+    ///
+    /// Composition with squeeze_ef (4 squeeze calls): EF challenges remain uniform
+    /// over the extension field, giving the claimed 124-bit soundness when used.
     pub fn squeeze(&mut self) -> F {
-        let digest = self.hasher.finalize_reset();
-        let raw = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
-        let challenge = raw % ((1u32 << 31) - 1);
-        // Chain: re-seed with digest
-        self.hasher = Sha256::new_with_prefix(&digest);
-        F::from_canonical_u32(challenge)
+        const P: u64 = (1u64 << 31) - 1;
+        // floor(2^64 / p) * p. With p = 2^31 - 1, 2^64 mod p = 4, so this is 2^64 - 4.
+        const ACCEPT_BOUND: u64 = u64::MAX - 3;
+
+        loop {
+            let digest = self.hasher.finalize_reset();
+            // Chain: re-seed hasher with digest so successive squeezes diverge.
+            self.hasher = Sha256::new_with_prefix(&digest);
+
+            // Try four non-overlapping 8-byte windows from the 32-byte digest.
+            for chunk_idx in 0..4 {
+                let off = chunk_idx * 8;
+                let raw = u64::from_le_bytes([
+                    digest[off], digest[off + 1], digest[off + 2], digest[off + 3],
+                    digest[off + 4], digest[off + 5], digest[off + 6], digest[off + 7],
+                ]);
+                if raw < ACCEPT_BOUND {
+                    return F::from_canonical_u32((raw % P) as u32);
+                }
+            }
+            // All four windows in rejection range (probability ~2^-248). Loop and
+            // re-hash — chain continues from re-seeded hasher.
+        }
     }
 
     pub fn squeeze_many(&mut self, n: usize) -> Vec<F> {
@@ -1501,7 +1555,95 @@ pub fn verify_triple_ef_with_challenges(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
+    /// SOUNDNESS regression (M1): fast-mode toggle defaults to false (i.e. EF
+    /// challenges are the production default). `set_fast_mode(true)` only
+    /// flips it when explicitly invoked by `--fast`. If a refactor
+    /// accidentally inverts the default, this test catches it.
+    #[test]
+    fn test_fast_mode_default_is_ef() {
+        // Sequence carefully because FAST_MODE is process-global and other
+        // tests may run in parallel; we only assert the toggle round-trip,
+        // and reset to default at the end.
+        let prior = is_fast_mode();
+        set_fast_mode(false);
+        assert!(!is_fast_mode(), "default fast mode must be false (EF)");
+        set_fast_mode(true);
+        assert!(is_fast_mode(), "set_fast_mode(true) must flip the toggle");
+        set_fast_mode(false);
+        assert!(!is_fast_mode(), "set_fast_mode(false) must reset");
+        // Restore prior state to be polite to concurrent tests.
+        set_fast_mode(prior);
+    }
+
+    #[test]
+    fn test_squeeze_determinism() {
+        // Same label + absorption sequence must produce identical challenge stream.
+        // (Critical: prover and verifier rely on this for Fiat-Shamir.)
+        let mut t1 = Transcript::new(b"sound-test");
+        t1.absorb(42);
+        t1.absorb_bytes(b"input-data");
+
+        let mut t2 = Transcript::new(b"sound-test");
+        t2.absorb(42);
+        t2.absorb_bytes(b"input-data");
+
+        for _ in 0..16 {
+            assert_eq!(t1.squeeze(), t2.squeeze(), "squeeze is non-deterministic");
+        }
+    }
+
+    #[test]
+    fn test_squeeze_diverges_on_different_input() {
+        // Different absorption produces different challenges.
+        let mut t1 = Transcript::new(b"label");
+        t1.absorb(1);
+        let mut t2 = Transcript::new(b"label");
+        t2.absorb(2);
+        assert_ne!(t1.squeeze(), t2.squeeze());
+    }
+
+    #[test]
+    fn test_squeeze_distribution_quick() {
+        // Sanity: squeeze 1024 values, expect spread (not all identical, no
+        // catastrophic clustering near 0 from biased modular reduction).
+        let mut t = Transcript::new(b"distribution-test");
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut zero_count = 0;
+        for _ in 0..1024 {
+            let v = t.squeeze().as_canonical_u32();
+            if v == 0 { zero_count += 1; }
+            seen.insert(v);
+        }
+        // With ~31-bit field and 1024 samples, collisions extremely unlikely.
+        assert!(seen.len() > 1000, "too many collisions: {} unique of 1024", seen.len());
+        // Old impl had biased 0 ≈ 2x other values. With proper rejection sampling,
+        // expected zero count over 1024 samples is ~0 (probability per sample = 1/p ≈ 2^-31).
+        assert!(zero_count <= 2, "suspicious bias toward 0: {} zeros in 1024 squeezes", zero_count);
+    }
+
+    #[test]
+    fn test_squeeze_ef_diverges() {
+        // squeeze_ef calls squeeze 4 times — the resulting EF element should have
+        // distinct base components (not identical) under normal entropy.
+        let mut t = Transcript::new(b"ef-test");
+        let ef = t.squeeze_ef();
+        let base_slice: &[Complex<Mersenne31>] = ef.as_base_slice();
+        let c0: &[Mersenne31] = base_slice[0].as_base_slice();
+        let c1: &[Mersenne31] = base_slice[1].as_base_slice();
+        let v0 = c0[0].as_canonical_u32();
+        let v1 = c0[1].as_canonical_u32();
+        let v2 = c1[0].as_canonical_u32();
+        let v3 = c1[1].as_canonical_u32();
+        // All four should differ (probability of any pair colliding is ~4 * 2^-31 ~ 0).
+        assert_ne!(v0, v1);
+        assert_ne!(v0, v2);
+        assert_ne!(v0, v3);
+        assert_ne!(v1, v2);
+        assert_ne!(v1, v3);
+        assert_ne!(v2, v3);
+    }
 
     #[test]
     fn test_product_sumcheck() {

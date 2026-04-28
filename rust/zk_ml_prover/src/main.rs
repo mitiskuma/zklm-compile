@@ -27,6 +27,16 @@ fn main() {
         eprintln!("  Metal GPU acceleration: ON");
     }
 
+    // --fast flag opts INTO base-field proving (~31-bit challenges).
+    // Default is extension-field (~124-bit challenges) for funding-grade soundness.
+    // SOUNDNESS (M1, Option C): switch is documented as opt-in to base mode.
+    if args.iter().any(|a| a == "--fast") {
+        crate::proving::sumcheck::set_fast_mode(true);
+        eprintln!("  Prover mode: --fast (base-field, ~31-bit challenges)");
+    } else {
+        eprintln!("  Prover mode: default (extension-field, ~124-bit challenges)");
+    }
+
     if args.len() >= 3 && args[1] == "--verify" {
         run_verify_mode(&args[2]);
         return;

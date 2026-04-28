@@ -49,6 +49,7 @@ pub fn build_gelu_table(scale: i32) -> LookupTable {
             root: [0u8; 32],
             num_weights: 65536,
             log_height: 16,
+            kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast,
         },
     }
 }
@@ -162,6 +163,7 @@ mod tests {
                 root: [0u8; 32],
                 num_weights: 256,
                 log_height: 8,
+                kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast,
             },
         }
     }

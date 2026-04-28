@@ -25,6 +25,8 @@ use crate::proving::sumcheck::{self, SumcheckProof, SumcheckProofEF, EFElement, 
 use crate::proving::weight_commitment::{
     commit_weights_fast, prove_mle_eval_no_merkle, verify_mle_eval, MleEvalProof,
     MleEvalProofEF, prove_mle_eval_no_merkle_ef_base, verify_mle_eval_ef,
+    prove_mle_eval_bound, prove_mle_eval_ef_base_bound,
+    verify_mle_eval_bound, verify_mle_eval_ef_bound,
     WeightCommitment,
 };
 
@@ -157,9 +159,10 @@ pub fn prove_layernorm(
         .map(|&v| F::from_canonical_u32(v))
         .collect();
     let xc_at_mean_s = mle_evaluate(&xc_pad, &s_mean);
-    let mut eval_t1 = Transcript::new(b"layernorm-xc-mean-eval");
-    eval_t1.absorb_bytes(&xc_commitment.root);
-    let (_, xc_mean_eval_proof) = prove_mle_eval_no_merkle(&xc_pad, &s_mean, &mut eval_t1);
+    // S2: bind inner MLE-eval to main transcript.
+    let (_, xc_mean_eval_proof) = prove_mle_eval_bound(
+        &xc_pad, &s_mean, b"layernorm-xc-mean-eval", &xc_commitment, transcript,
+    );
 
     // --- Step 2: Variance check ---
     // Prove Σ x_centered[i]² via product sumcheck (xc · xc)
@@ -175,9 +178,9 @@ pub fn prove_layernorm(
         .map(|&v| F::from_canonical_u32(v))
         .collect();
     let xc_at_var_s = mle_evaluate(&xc_pad, &s_var);
-    let mut eval_t2 = Transcript::new(b"layernorm-xc-var-eval");
-    eval_t2.absorb_bytes(&xc_commitment.root);
-    let (_, xc_var_eval_proof) = prove_mle_eval_no_merkle(&xc_pad, &s_var, &mut eval_t2);
+    let (_, xc_var_eval_proof) = prove_mle_eval_bound(
+        &xc_pad, &s_var, b"layernorm-xc-var-eval", &xc_commitment, transcript,
+    );
 
     // --- Step 3: Output check ---
     // y[i] = gamma[i] * xc[i] * r + beta[i]
@@ -197,14 +200,14 @@ pub fn prove_layernorm(
         .collect();
 
     let xc_at_output_s = mle_evaluate(&xc_pad, &s_out);
-    let mut eval_t3 = Transcript::new(b"layernorm-xc-output-eval");
-    eval_t3.absorb_bytes(&xc_commitment.root);
-    let (_, xc_output_eval_proof) = prove_mle_eval_no_merkle(&xc_pad, &s_out, &mut eval_t3);
+    let (_, xc_output_eval_proof) = prove_mle_eval_bound(
+        &xc_pad, &s_out, b"layernorm-xc-output-eval", &xc_commitment, transcript,
+    );
 
     let gamma_at_output_s = mle_evaluate(&gamma_pad, &s_out);
-    let mut eval_t4 = Transcript::new(b"layernorm-gamma-output-eval");
-    eval_t4.absorb_bytes(&gamma_commitment.root);
-    let (_, gamma_output_eval_proof) = prove_mle_eval_no_merkle(&gamma_pad, &s_out, &mut eval_t4);
+    let (_, gamma_output_eval_proof) = prove_mle_eval_bound(
+        &gamma_pad, &s_out, b"layernorm-gamma-output-eval", &gamma_commitment, transcript,
+    );
 
     LayerNormProof {
         mu: mu.as_canonical_u32(),
@@ -310,14 +313,14 @@ pub fn verify_layernorm(
         eprintln!("LayerNorm: xc_at_mean_s mismatch");
         return false;
     }
-    let mut eval_t1 = Transcript::new(b"layernorm-xc-mean-eval");
-    eval_t1.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval(
+    // S2: bind to main transcript via verify helper.
+    if !verify_mle_eval_bound(
         &proof.xc_commitment,
         xc_at_mean_s,
         &s_mean,
         &proof.xc_mean_eval_proof,
-        &mut eval_t1,
+        b"layernorm-xc-mean-eval",
+        transcript,
     ) {
         eprintln!("LayerNorm: xc mean MLE eval proof failed");
         return false;
@@ -351,14 +354,13 @@ pub fn verify_layernorm(
         eprintln!("LayerNorm: xc_at_var_s mismatch");
         return false;
     }
-    let mut eval_t2 = Transcript::new(b"layernorm-xc-var-eval");
-    eval_t2.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval(
+    if !verify_mle_eval_bound(
         &proof.xc_commitment,
         xc_at_var_s,
         &s_var,
         &proof.xc_var_eval_proof,
-        &mut eval_t2,
+        b"layernorm-xc-var-eval",
+        transcript,
     ) {
         eprintln!("LayerNorm: xc var MLE eval proof failed");
         return false;
@@ -408,14 +410,13 @@ pub fn verify_layernorm(
         eprintln!("LayerNorm: xc_at_output_s mismatch");
         return false;
     }
-    let mut eval_t3 = Transcript::new(b"layernorm-xc-output-eval");
-    eval_t3.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval(
+    if !verify_mle_eval_bound(
         &proof.xc_commitment,
         xc_at_output_s,
         &s_out,
         &proof.xc_output_eval_proof,
-        &mut eval_t3,
+        b"layernorm-xc-output-eval",
+        transcript,
     ) {
         eprintln!("LayerNorm: xc output MLE eval proof failed");
         return false;
@@ -427,14 +428,13 @@ pub fn verify_layernorm(
         eprintln!("LayerNorm: gamma_at_output_s mismatch");
         return false;
     }
-    let mut eval_t4 = Transcript::new(b"layernorm-gamma-output-eval");
-    eval_t4.absorb_bytes(&proof.gamma_commitment.root);
-    if !verify_mle_eval(
+    if !verify_mle_eval_bound(
         &proof.gamma_commitment,
         gamma_at_output_s,
         &s_out,
         &proof.gamma_output_eval_proof,
-        &mut eval_t4,
+        b"layernorm-gamma-output-eval",
+        transcript,
     ) {
         eprintln!("LayerNorm: gamma output MLE eval proof failed");
         return false;
@@ -583,9 +583,10 @@ pub fn prove_layernorm_sqr(
 
     let s_mean: Vec<F> = mean_check_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let xc_at_mean_s = mle_evaluate(&xc_pad, &s_mean);
-    let mut eval_t1 = Transcript::new(b"lnsqr-xc-mean");
-    eval_t1.absorb_bytes(&xc_commitment.root);
-    let (_, xc_mean_eval_proof) = prove_mle_eval_no_merkle(&xc_pad, &s_mean, &mut eval_t1);
+    // S2: bind to main transcript.
+    let (_, xc_mean_eval_proof) = prove_mle_eval_bound(
+        &xc_pad, &s_mean, b"lnsqr-xc-mean", &xc_commitment, transcript,
+    );
 
     // --- Step 2: Variance check (Σ xc[i]² = sum_sq) ---
     let (var_proof, xc_var_a, xc_var_b) =
@@ -593,9 +594,9 @@ pub fn prove_layernorm_sqr(
 
     let s_var: Vec<F> = var_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let xc_at_var_s = mle_evaluate(&xc_pad, &s_var);
-    let mut eval_t2 = Transcript::new(b"lnsqr-xc-var");
-    eval_t2.absorb_bytes(&xc_commitment.root);
-    let (_, xc_var_eval_proof) = prove_mle_eval_no_merkle(&xc_pad, &s_var, &mut eval_t2);
+    let (_, xc_var_eval_proof) = prove_mle_eval_bound(
+        &xc_pad, &s_var, b"lnsqr-xc-var", &xc_commitment, transcript,
+    );
 
     // --- Step 3: g-consistency check ---
     // Prove Σ eq(ρ,i) · g[i] == Σ eq(ρ,i) · γ[i] · xc[i] at same point
@@ -610,9 +611,9 @@ pub fn prove_layernorm_sqr(
 
     let s_gp: Vec<F> = g_prod_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let g_at_prod_s = mle_evaluate(&g_pad, &s_gp);
-    let mut eval_t3 = Transcript::new(b"lnsqr-g-prod");
-    eval_t3.absorb_bytes(&g_commitment.root);
-    let (_, g_prod_eval_proof) = prove_mle_eval_no_merkle(&g_pad, &s_gp, &mut eval_t3);
+    let (_, g_prod_eval_proof) = prove_mle_eval_bound(
+        &g_pad, &s_gp, b"lnsqr-g-prod", &g_commitment, transcript,
+    );
 
     // Triple sumcheck: Σ eq · γ · xc = t_g (same claimed value)
     let (g_triple_proof, eq_at_gt, gamma_at_gt, xc_at_gt) =
@@ -620,13 +621,13 @@ pub fn prove_layernorm_sqr(
 
     let s_gt: Vec<F> = g_triple_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let xc_at_triple_s = mle_evaluate(&xc_pad, &s_gt);
-    let mut eval_t4 = Transcript::new(b"lnsqr-xc-triple");
-    eval_t4.absorb_bytes(&xc_commitment.root);
-    let (_, xc_triple_eval_proof) = prove_mle_eval_no_merkle(&xc_pad, &s_gt, &mut eval_t4);
+    let (_, xc_triple_eval_proof) = prove_mle_eval_bound(
+        &xc_pad, &s_gt, b"lnsqr-xc-triple", &xc_commitment, transcript,
+    );
     let gamma_at_triple_s = mle_evaluate(&gamma_pad, &s_gt);
-    let mut eval_t5 = Transcript::new(b"lnsqr-gamma-triple");
-    eval_t5.absorb_bytes(&gamma_commitment.root);
-    let (_, gamma_triple_eval_proof) = prove_mle_eval_no_merkle(&gamma_pad, &s_gt, &mut eval_t5);
+    let (_, gamma_triple_eval_proof) = prove_mle_eval_bound(
+        &gamma_pad, &s_gt, b"lnsqr-gamma-triple", &gamma_commitment, transcript,
+    );
 
     // --- Step 4: Squared checks ---
     let sq_point = transcript.squeeze_many(log_n);
@@ -639,9 +640,9 @@ pub fn prove_layernorm_sqr(
 
     let s_hs: Vec<F> = h_sq_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let h_at_sq_s = mle_evaluate(&h_pad, &s_hs);
-    let mut eval_t6 = Transcript::new(b"lnsqr-h-sq");
-    eval_t6.absorb_bytes(&h_commitment.root);
-    let (_, h_sq_eval_proof) = prove_mle_eval_no_merkle(&h_pad, &s_hs, &mut eval_t6);
+    let (_, h_sq_eval_proof) = prove_mle_eval_bound(
+        &h_pad, &s_hs, b"lnsqr-h-sq", &h_commitment, transcript,
+    );
 
     // g-squared: S_g = Σ eq · g · g
     let s_g_val: F = eq_sq.iter().zip(g_pad.iter()).map(|(&e, &g)| e * g * g).sum();
@@ -650,9 +651,9 @@ pub fn prove_layernorm_sqr(
 
     let s_gs: Vec<F> = g_sq_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let g_at_gsq_s = mle_evaluate(&g_pad, &s_gs);
-    let mut eval_t7 = Transcript::new(b"lnsqr-g-sq");
-    eval_t7.absorb_bytes(&g_commitment.root);
-    let (_, g_sq_eval_proof) = prove_mle_eval_no_merkle(&g_pad, &s_gs, &mut eval_t7);
+    let (_, g_sq_eval_proof) = prove_mle_eval_bound(
+        &g_pad, &s_gs, b"lnsqr-g-sq", &g_commitment, transcript,
+    );
 
     LayerNormSqrProof {
         mu: mu.as_canonical_u32(),
@@ -731,9 +732,11 @@ pub fn verify_layernorm_sqr(
     let xc_at_mean_s = F::from_canonical_u32(proof.xc_at_mean_s);
     if xc_at_mean_s != xc_at_s_mean { return false; }
     let s_mean: Vec<F> = proof.mean_check_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
-    let mut eval_t1 = Transcript::new(b"lnsqr-xc-mean");
-    eval_t1.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval(&proof.xc_commitment, xc_at_mean_s, &s_mean, &proof.xc_mean_eval_proof, &mut eval_t1) {
+    // S2: bind to main transcript via verify helper.
+    if !verify_mle_eval_bound(
+        &proof.xc_commitment, xc_at_mean_s, &s_mean, &proof.xc_mean_eval_proof,
+        b"lnsqr-xc-mean", transcript,
+    ) {
         eprintln!("LayerNormSqr: xc mean MLE eval failed");
         return false;
     }
@@ -752,9 +755,10 @@ pub fn verify_layernorm_sqr(
     let xc_at_var_s = F::from_canonical_u32(proof.xc_at_var_s);
     if xc_at_var_s != xc_var_a { return false; }
     let s_var: Vec<F> = proof.var_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
-    let mut eval_t2 = Transcript::new(b"lnsqr-xc-var");
-    eval_t2.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval(&proof.xc_commitment, xc_at_var_s, &s_var, &proof.xc_var_eval_proof, &mut eval_t2) {
+    if !verify_mle_eval_bound(
+        &proof.xc_commitment, xc_at_var_s, &s_var, &proof.xc_var_eval_proof,
+        b"lnsqr-xc-var", transcript,
+    ) {
         eprintln!("LayerNormSqr: xc var MLE eval failed");
         return false;
     }
@@ -780,9 +784,10 @@ pub fn verify_layernorm_sqr(
     }
     let g_at_prod_s = F::from_canonical_u32(proof.g_at_prod_s);
     if g_at_prod_s != g_at_gp { return false; }
-    let mut eval_t3 = Transcript::new(b"lnsqr-g-prod");
-    eval_t3.absorb_bytes(&proof.g_commitment.root);
-    if !verify_mle_eval(&proof.g_commitment, g_at_prod_s, &s_gp, &proof.g_prod_eval_proof, &mut eval_t3) {
+    if !verify_mle_eval_bound(
+        &proof.g_commitment, g_at_prod_s, &s_gp, &proof.g_prod_eval_proof,
+        b"lnsqr-g-prod", transcript,
+    ) {
         eprintln!("LayerNormSqr: g prod MLE eval failed");
         return false;
     }
@@ -805,17 +810,19 @@ pub fn verify_layernorm_sqr(
     }
     let xc_at_triple_s = F::from_canonical_u32(proof.xc_at_triple_s);
     if xc_at_triple_s != xc_at_gt { return false; }
-    let mut eval_t4 = Transcript::new(b"lnsqr-xc-triple");
-    eval_t4.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval(&proof.xc_commitment, xc_at_triple_s, &s_gt, &proof.xc_triple_eval_proof, &mut eval_t4) {
+    if !verify_mle_eval_bound(
+        &proof.xc_commitment, xc_at_triple_s, &s_gt, &proof.xc_triple_eval_proof,
+        b"lnsqr-xc-triple", transcript,
+    ) {
         eprintln!("LayerNormSqr: xc triple MLE eval failed");
         return false;
     }
     let gamma_at_triple_s = F::from_canonical_u32(proof.gamma_at_triple_s);
     if gamma_at_triple_s != gamma_at_gt { return false; }
-    let mut eval_t5 = Transcript::new(b"lnsqr-gamma-triple");
-    eval_t5.absorb_bytes(&proof.gamma_commitment.root);
-    if !verify_mle_eval(&proof.gamma_commitment, gamma_at_triple_s, &s_gt, &proof.gamma_triple_eval_proof, &mut eval_t5) {
+    if !verify_mle_eval_bound(
+        &proof.gamma_commitment, gamma_at_triple_s, &s_gt, &proof.gamma_triple_eval_proof,
+        b"lnsqr-gamma-triple", transcript,
+    ) {
         eprintln!("LayerNormSqr: gamma triple MLE eval failed");
         return false;
     }
@@ -847,9 +854,10 @@ pub fn verify_layernorm_sqr(
     }
     let h_at_sq_s = F::from_canonical_u32(proof.h_at_sq_s);
     if h_at_sq_s != h_at_hs_a { return false; }
-    let mut eval_t6 = Transcript::new(b"lnsqr-h-sq");
-    eval_t6.absorb_bytes(&proof.h_commitment.root);
-    if !verify_mle_eval(&proof.h_commitment, h_at_sq_s, &s_hs, &proof.h_sq_eval_proof, &mut eval_t6) {
+    if !verify_mle_eval_bound(
+        &proof.h_commitment, h_at_sq_s, &s_hs, &proof.h_sq_eval_proof,
+        b"lnsqr-h-sq", transcript,
+    ) {
         eprintln!("LayerNormSqr: h sq MLE eval failed");
         return false;
     }
@@ -891,9 +899,10 @@ pub fn verify_layernorm_sqr(
     }
     let g_at_gsq_s = F::from_canonical_u32(proof.g_at_gsq_s);
     if g_at_gsq_s != g_at_gs_a { return false; }
-    let mut eval_t7 = Transcript::new(b"lnsqr-g-sq");
-    eval_t7.absorb_bytes(&proof.g_commitment.root);
-    if !verify_mle_eval(&proof.g_commitment, g_at_gsq_s, &s_gs, &proof.g_sq_eval_proof, &mut eval_t7) {
+    if !verify_mle_eval_bound(
+        &proof.g_commitment, g_at_gsq_s, &s_gs, &proof.g_sq_eval_proof,
+        b"lnsqr-g-sq", transcript,
+    ) {
         eprintln!("LayerNormSqr: g sq MLE eval failed");
         return false;
     }
@@ -1011,9 +1020,10 @@ pub fn prove_layernorm_ef(
 
     let s_mean: Vec<EF> = mean_check_proof.challenges.iter().map(|v| v.to_ef()).collect();
     let xc_at_mean_s = mle_evaluate_ef(&xc_pad, &s_mean);
-    let mut eval_t1 = Transcript::new(b"layernorm-xc-mean-eval");
-    eval_t1.absorb_bytes(&xc_commitment.root);
-    let (_, xc_mean_eval_proof) = prove_mle_eval_no_merkle_ef_base(&xc_pad, &s_mean, &mut eval_t1);
+    // S2: bind to main transcript.
+    let (_, xc_mean_eval_proof) = prove_mle_eval_ef_base_bound(
+        &xc_pad, &s_mean, b"layernorm-xc-mean-eval", &xc_commitment, transcript,
+    );
 
     // --- Variance check: Σ xc·xc = sum_sq (EF product sumcheck) ---
     let (var_proof, _xc_var_a, _xc_var_b) =
@@ -1021,9 +1031,9 @@ pub fn prove_layernorm_ef(
 
     let s_var: Vec<EF> = var_proof.challenges.iter().map(|v| v.to_ef()).collect();
     let xc_at_var_s = mle_evaluate_ef(&xc_pad, &s_var);
-    let mut eval_t2 = Transcript::new(b"layernorm-xc-var-eval");
-    eval_t2.absorb_bytes(&xc_commitment.root);
-    let (_, xc_var_eval_proof) = prove_mle_eval_no_merkle_ef_base(&xc_pad, &s_var, &mut eval_t2);
+    let (_, xc_var_eval_proof) = prove_mle_eval_ef_base_bound(
+        &xc_pad, &s_var, b"layernorm-xc-var-eval", &xc_commitment, transcript,
+    );
 
     // --- Output check: Σ eq·γ·xc = claimed (EF triple sumcheck) ---
     let eval_point = transcript.squeeze_ef_many(log_n);
@@ -1036,14 +1046,14 @@ pub fn prove_layernorm_ef(
 
     let s_out: Vec<EF> = output_proof.challenges.iter().map(|v| v.to_ef()).collect();
     let xc_at_out_s = mle_evaluate_ef(&xc_pad, &s_out);
-    let mut eval_t3 = Transcript::new(b"layernorm-xc-output-eval");
-    eval_t3.absorb_bytes(&xc_commitment.root);
-    let (_, xc_out_eval_proof) = prove_mle_eval_no_merkle_ef_base(&xc_pad, &s_out, &mut eval_t3);
+    let (_, xc_out_eval_proof) = prove_mle_eval_ef_base_bound(
+        &xc_pad, &s_out, b"layernorm-xc-output-eval", &xc_commitment, transcript,
+    );
 
     let gamma_at_out_s = mle_evaluate_ef(&gamma_pad, &s_out);
-    let mut eval_t4 = Transcript::new(b"layernorm-gamma-output-eval");
-    eval_t4.absorb_bytes(&gamma_commitment.root);
-    let (_, gamma_out_eval_proof) = prove_mle_eval_no_merkle_ef_base(&gamma_pad, &s_out, &mut eval_t4);
+    let (_, gamma_out_eval_proof) = prove_mle_eval_ef_base_bound(
+        &gamma_pad, &s_out, b"layernorm-gamma-output-eval", &gamma_commitment, transcript,
+    );
 
     LayerNormProofEF {
         mu: mu.as_canonical_u32(),
@@ -1108,11 +1118,12 @@ pub fn verify_layernorm_ef(
     );
     if !mean_ok { eprintln!("LayerNorm EF: mean check failed"); return false; }
 
-    // Verify xc MLE eval at mean challenge point
+    // Verify xc MLE eval at mean challenge point — S2: bind to main transcript.
     let s_mean = mean_challenges;
-    let mut eval_t1 = Transcript::new(b"layernorm-xc-mean-eval");
-    eval_t1.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval_ef(&proof.xc_commitment, xc_at_mean, &s_mean, &proof.xc_mean_eval_proof, &mut eval_t1) {
+    if !verify_mle_eval_ef_bound(
+        &proof.xc_commitment, xc_at_mean, &s_mean, &proof.xc_mean_eval_proof,
+        b"layernorm-xc-mean-eval", transcript,
+    ) {
         eprintln!("LayerNorm EF: xc mean eval failed"); return false;
     }
 
@@ -1129,9 +1140,10 @@ pub fn verify_layernorm_ef(
     if !var_ok { eprintln!("LayerNorm EF: var check failed"); return false; }
 
     let s_var = var_challenges;
-    let mut eval_t2 = Transcript::new(b"layernorm-xc-var-eval");
-    eval_t2.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval_ef(&proof.xc_commitment, xc_var, &s_var, &proof.xc_var_eval_proof, &mut eval_t2) {
+    if !verify_mle_eval_ef_bound(
+        &proof.xc_commitment, xc_var, &s_var, &proof.xc_var_eval_proof,
+        b"layernorm-xc-var-eval", transcript,
+    ) {
         eprintln!("LayerNorm EF: xc var eval failed"); return false;
     }
 
@@ -1167,16 +1179,18 @@ pub fn verify_layernorm_ef(
         return false;
     }
 
-    // Verify xc + gamma MLE eval proofs at output challenge point
-    let mut eval_t3 = Transcript::new(b"layernorm-xc-output-eval");
-    eval_t3.absorb_bytes(&proof.xc_commitment.root);
-    if !verify_mle_eval_ef(&proof.xc_commitment, xc_at_s, s_out, &proof.xc_out_eval_proof, &mut eval_t3) {
+    // Verify xc + gamma MLE eval proofs at output challenge point — bound to main transcript.
+    if !verify_mle_eval_ef_bound(
+        &proof.xc_commitment, xc_at_s, s_out, &proof.xc_out_eval_proof,
+        b"layernorm-xc-output-eval", transcript,
+    ) {
         eprintln!("LayerNorm EF: xc output eval failed"); return false;
     }
 
-    let mut eval_t4 = Transcript::new(b"layernorm-gamma-output-eval");
-    eval_t4.absorb_bytes(&proof.gamma_commitment.root);
-    if !verify_mle_eval_ef(&proof.gamma_commitment, gamma_at_s, s_out, &proof.gamma_out_eval_proof, &mut eval_t4) {
+    if !verify_mle_eval_ef_bound(
+        &proof.gamma_commitment, gamma_at_s, s_out, &proof.gamma_out_eval_proof,
+        b"layernorm-gamma-output-eval", transcript,
+    ) {
         eprintln!("LayerNorm EF: gamma output eval failed"); return false;
     }
 

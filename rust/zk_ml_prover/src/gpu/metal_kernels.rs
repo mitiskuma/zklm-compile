@@ -5,7 +5,7 @@ use p3_field::{AbstractField, PrimeField32};
 use p3_mersenne_31::Mersenne31;
 
 use super::metal_buffer::GpuBuffer;
-use super::metal_device::MetalContext;
+use super::metal_device::{MetalContext, wait_and_check};
 
 type F = Mersenne31;
 
@@ -69,7 +69,7 @@ impl MetalKernels {
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_and_check(&cmd, "sumcheck_fold");
     }
 
     /// Fold two buffers in one command buffer (saves a dispatch round-trip).
@@ -104,7 +104,7 @@ impl MetalKernels {
         enc.end_encoding();
 
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_and_check(&cmd, "sumcheck_fold_pair");
     }
 
     /// Fold three buffers in one command buffer.
@@ -130,7 +130,7 @@ impl MetalKernels {
         }
 
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_and_check(&cmd, "sumcheck_fold_triple");
     }
 
     /// Dispatch sumcheck_reduce_product, return (s0, s1, s2).
@@ -154,7 +154,7 @@ impl MetalKernels {
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_and_check(&cmd, "sumcheck_reduce_product");
 
         let data = partials.as_u32_slice_mut();
         let mut s0 = F::zero();
@@ -192,7 +192,7 @@ impl MetalKernels {
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_and_check(&cmd, "sumcheck_reduce_triple");
 
         let data = partials.as_u32_slice_mut();
         let mut s0 = F::zero();
@@ -225,7 +225,7 @@ impl MetalKernels {
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_and_check(&cmd, "batch_inverse");
     }
 
     /// eq_evals butterfly: one level.
@@ -249,7 +249,7 @@ impl MetalKernels {
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_and_check(&cmd, "eq_butterfly");
     }
 }
 

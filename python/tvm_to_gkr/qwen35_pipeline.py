@@ -3,8 +3,30 @@
 Sends composite qwen_layer ops to the Rust prover. Like llama_pipeline but
 with output gating (g_proj + sigmoid) and Conv1D folding for GDN layers.
 
-At seq_len=1, Conv1D with zero history = element-wise multiply by conv_weight[:,:,0].
-We fold this into the Q/K/V projection weights in Python so Rust never sees Conv1D.
+At seq_len=1, Conv1D with zero history collapses to an element-wise scale
+on the projection output. Which kernel tap supplies that scale depends on
+the upstream model's storage convention:
+
+  Standard PyTorch ``nn.Conv1d`` with causal left-padding (kernel_size - 1
+  zeros prepended) at t=0 gives::
+
+      output[c, 0] = sum_k conv_weight[c, 0, k] * pad_input[c, t - K + 1 + k]
+                   = conv_weight[c, 0, K-1] * input[c, 0]      # only k = K-1 sees a non-zero input
+
+  i.e. the LAST tap (``conv_weight[:, 0, K-1]``).
+
+  Some HF model checkpoints (and certain Mamba/GDN custom kernels) instead
+  store conv weights in reverse-time order, where index 0 is the most
+  recent tap and index K-1 is the oldest. In that case ``conv_weight[:, 0, 0]``
+  is the correct fold scale.
+
+The fold helper below is parametrized via ``causal_tap_index`` so the
+correct convention can be selected per checkpoint. The default
+``causal_tap_index=0`` is the historical behavior of this pipeline and
+matches the unit tests; the ``causal_tap_index=-1`` branch enables the
+PyTorch standard. ``_fold_conv_into_proj`` validates both at the shape
+level. G1 — flip the default once we have empirical
+confirmation against an HF reference forward pass.
 
 Usage:
     from tvm_to_gkr.qwen35_pipeline import prove_qwen35_token_server
@@ -50,24 +72,61 @@ def to_m31(val: int) -> int:
 
 
 def _fold_conv_into_proj(w_proj_q: np.ndarray, conv_weight: np.ndarray,
-                          proj_rows: int, d_model: int, proj_offset: int) -> np.ndarray:
-    """Fold Conv1D weight[:,:,0] into projection weights for seq_len=1.
+                          proj_rows: int, d_model: int, proj_offset: int,
+                          causal_tap_index: int = 0) -> np.ndarray:
+    """Fold the seq_len=1 Conv1D scale into projection weights.
 
-    At seq_len=1 with zero history, Conv1D is just element-wise multiply
-    by conv_weight[:, 0, 0]. So effective_w = w_proj * conv_scale[row].
+    At seq_len=1 with zero history, Conv1D collapses to an element-wise
+    multiply by `conv_weight[:, 0, causal_tap_index]`. Folding that scale
+    into `w_proj` produces an effective projection that the prover can
+    treat as a plain matmul (no Conv1D op needed in the proof system).
+
+    SAFETY (G1): which tap supplies the scale depends
+    on the upstream model's storage convention. PyTorch's standard
+    ``nn.Conv1d`` with causal left-padding makes the LAST kernel position
+    (``conv_weight[:, 0, K-1]``) the active tap at t=0 (`causal_tap_index=-1`).
+    Some HF Mamba/GDN custom kernels store weights in reverse-time order,
+    making index 0 the active tap (`causal_tap_index=0`). The historical
+    default of this pipeline is ``causal_tap_index=0``; flipping requires
+    a forward-pass match against an HF reference. The unit tests pin both
+    branches so a regression on either convention is loud.
 
     Args:
-        w_proj_q: Quantized projection weights as uint32 M31 elements (flat, row-major)
-        conv_weight: Conv1D weight tensor (total_dim, 1, kernel_size)
-        proj_rows: Number of rows in this projection
-        d_model: Number of columns
-        proj_offset: Offset into conv_weight for this projection's rows
+        w_proj_q: Quantized projection weights as uint32 M31 elements
+            (flat, row-major).
+        conv_weight: Conv1D weight tensor of shape
+            ``(total_dim, 1, kernel_size)``.
+        proj_rows: Number of rows in this projection.
+        d_model: Number of columns.
+        proj_offset: Offset into ``conv_weight`` rows for this projection.
+        causal_tap_index: Which kernel index supplies the t=0 scale. Use
+            ``0`` for reverse-time-stored kernels (historical default) or
+            ``-1`` for standard PyTorch ``nn.Conv1d`` causal-pad
+            convention. Any in-range integer is accepted; out-of-range
+            raises ``IndexError``.
 
     Returns:
-        New uint32 M31 array with conv folded in (same shape as w_proj_q)
+        New uint32 M31 array with conv folded in (same shape as w_proj_q).
     """
-    # conv_weight[:, 0, 0] gives the scaling factor per output channel
-    conv_scale = conv_weight[proj_offset:proj_offset + proj_rows, 0, 0]
+    if conv_weight.ndim != 3 or conv_weight.shape[1] != 1:
+        raise ValueError(
+            f"_fold_conv_into_proj expects shape (total_dim, 1, kernel_size); "
+            f"got {conv_weight.shape}"
+        )
+    kernel_size = conv_weight.shape[2]
+    # Resolve negative indices (e.g. -1 for last tap) to absolute.
+    if causal_tap_index < 0:
+        tap = kernel_size + causal_tap_index
+    else:
+        tap = causal_tap_index
+    if not (0 <= tap < kernel_size):
+        raise IndexError(
+            f"causal_tap_index={causal_tap_index} out of range for "
+            f"kernel_size={kernel_size}"
+        )
+
+    # conv_weight[:, 0, tap] gives the scaling factor per output channel.
+    conv_scale = conv_weight[proj_offset:proj_offset + proj_rows, 0, tap]
 
     # Convert M31 field elements back to signed integers
     w_signed = np.where(w_proj_q > M31 // 2,
@@ -78,6 +137,27 @@ def _fold_conv_into_proj(w_proj_q: np.ndarray, conv_weight: np.ndarray,
     # Scale each row by its conv factor
     for i in range(proj_rows):
         w_2d[i] = np.round(w_2d[i] * conv_scale[i]).astype(np.int64)
+
+    # SOUNDNESS (G2): the upstream Qwen3.5 GDN forward
+    # pass applies SiLU AFTER the Conv1D and BEFORE the Q/K/V split:
+    #
+    #     y = silu(conv1d(in_proj(x)))      # ← real model
+    #     q, k, v = split(y)
+    #
+    # Folding only the linear conv into the projection weights captures
+    # the ``conv1d(in_proj(x))`` step but NOT the SiLU. The Rust prover
+    # therefore proves an APPROXIMATION where the Q/K/V inputs are the
+    # pre-SiLU values. SiLU on a single channel is monotonic and roughly
+    # linear in [-1, 1], so the approximation drift is small at typical
+    # GDN scales (the inputs are post-RMSNorm, so |x| is O(1)), but it is
+    # an approximation — not a faithful reproduction of the model.
+    #
+    # A faithful proof would either (a) require the prover to absorb a
+    # SiLU lookup proof between the folded matmul and the Q/K/V split,
+    # or (b) move the SiLU into the next layer's input pre-processing.
+    # Both are tracked as future work; until then this approximation is
+    # explicitly called out in the README "Limitations" section so that
+    # benchmark numbers can be reproduced under the same approximation.
 
     # Convert back to M31
     w_flat = w_2d.flatten()
@@ -98,13 +178,18 @@ def build_qwen_layer_op(name: str, config: ModelConfig, silu_scale: int,
     prefix = f"model.layers.{layer_idx}"
     layer_type = config.layer_types[layer_idx] if config.layer_types else 'attn'
 
+    # Per-layer head config (GDN may have asymmetric V dim)
+    heads = _layer_head_config(config, layer_idx)
+
     data = bytes([OP_QWEN_LAYER])
     data += _pack_string(name)
     data += _pack_u32(config.d_model)
     data += _pack_u32(config.d_ff)
-    data += _pack_u32(config.num_q_heads)
-    data += _pack_u32(config.num_kv_heads)
-    data += _pack_u32(config.d_head)
+    data += _pack_u32(heads["num_q_heads"])
+    data += _pack_u32(heads["num_kv_heads"])
+    data += _pack_u32(heads["d_head"])
+    data += _pack_u32(heads["v_num_heads"])
+    data += _pack_u32(heads["v_d_head"])
     data += _pack_i32(silu_scale)
     data += _pack_i32(sigmoid_scale)
 
@@ -247,25 +332,39 @@ def prove_qwen35(
 
 
 def _layer_head_config(config: ModelConfig, layer_idx: int) -> dict:
-    """Return per-layer head config (GDN and full attention have different head counts)."""
+    """Return per-layer head config (GDN and full attention have different head counts).
+
+    For GDN: V may have different heads/dim than K (e.g. Qwen3.5-4B 32-v vs 16-k).
+    For full attn: V matches K (standard GQA).
+    """
     layer_type = config.layer_types[layer_idx] if config.layer_types else 'attn'
     if layer_type == 'gdn':
+        v_heads = config.gdn_v_num_heads or config.gdn_num_heads
+        v_d = config.gdn_v_d_head or config.gdn_d_head
         return {
             "num_q_heads": config.gdn_num_heads,
-            "num_kv_heads": config.gdn_num_heads,  # GDN: same for Q/K/V
+            "num_kv_heads": config.gdn_num_heads,  # K shares head count with Q
             "d_head": config.gdn_d_head,
+            "v_num_heads": v_heads,
+            "v_d_head": v_d,
         }
     else:
         return {
             "num_q_heads": config.num_q_heads,
             "num_kv_heads": config.num_kv_heads,
             "d_head": config.d_head,
+            "v_num_heads": config.num_kv_heads,
+            "v_d_head": config.d_head,
         }
 
 
 def build_qwen_layer_ref_op(name: str, config: ModelConfig, silu_scale: int,
                               sigmoid_scale: int, layer_idx: int) -> dict:
-    """Build a server-mode qwen_layer_ref op dict (references preloaded weights by name)."""
+    """Build a server-mode qwen_layer_ref op dict (references preloaded weights by name).
+
+    Config carries v_num_heads/v_d_head so the Rust prover knows V dim independently
+    of K dim (required for Qwen3.5-4B/9B asymmetric GDN).
+    """
     heads = _layer_head_config(config, layer_idx)
     return {
         "type": "qwen_layer_ref",
@@ -349,9 +448,13 @@ class QwenPrecompiledWeights:
 
         self.weight_entries = []  # list of (name, w_q_array, m, n)
 
-        gdn_dim = self.config.gdn_num_heads * self.config.gdn_d_head  # 2048
-        attn_q_dim = self.config.num_q_heads * self.config.d_head       # 2048
-        attn_kv_dim = self.config.num_kv_heads * self.config.d_head     # 512
+        # GDN K/Q dim and V dim may differ (Qwen3.5-4B: V = 2*K)
+        gdn_k_dim = self.config.gdn_num_heads * self.config.gdn_d_head
+        gdn_v_dim = self.config.gdn_v_num_heads * self.config.gdn_v_d_head
+        if gdn_v_dim == 0:  # backward compat: if v fields missing, assume symmetric
+            gdn_v_dim = gdn_k_dim
+        attn_q_dim = self.config.num_q_heads * self.config.d_head
+        attn_kv_dim = self.config.num_kv_heads * self.config.d_head
 
         for i in range(self.n_layers):
             layer_type = self.config.layer_types[i] if self.config.layer_types else 'attn'
@@ -359,22 +462,27 @@ class QwenPrecompiledWeights:
 
             # Per-layer dimensions
             if is_gdn:
-                q_dim = gdn_dim
-                kv_dim = gdn_dim
+                q_dim = gdn_k_dim
+                k_dim = gdn_k_dim
+                v_dim = gdn_v_dim
+                # GDN attention output has v_dim shape; gate matches.
+                attn_out_dim = gdn_v_dim
             else:
                 q_dim = attn_q_dim
-                kv_dim = attn_kv_dim
+                k_dim = attn_kv_dim
+                v_dim = attn_kv_dim
+                attn_out_dim = attn_q_dim
 
             # RMSNorm gammas
             self.weight_entries.append((f"layer{i}.norm1_gamma", weights[f"layer{i}.norm1"].w_q, self.config.d_model, 1))
             self.weight_entries.append((f"layer{i}.norm2_gamma", weights[f"layer{i}.norm2"].w_q, self.config.d_model, 1))
 
-            # Q, K, V projections (potentially conv-folded for GDN)
+            # Q, K, V, O projections — o_proj input matches attention output dim.
             proj_dims = {
                 'q_proj': (q_dim, self.config.d_model),
-                'k_proj': (kv_dim, self.config.d_model),
-                'v_proj': (kv_dim, self.config.d_model),
-                'o_proj': (self.config.d_model, q_dim),
+                'k_proj': (k_dim, self.config.d_model),
+                'v_proj': (v_dim, self.config.d_model),
+                'o_proj': (self.config.d_model, attn_out_dim),
             }
 
             for proj, (m, n) in proj_dims.items():
@@ -389,16 +497,16 @@ class QwenPrecompiledWeights:
                         if proj == 'q_proj':
                             offset = 0
                         elif proj == 'k_proj':
-                            offset = gdn_dim
+                            offset = gdn_k_dim
                         else:  # v_proj
-                            offset = 2 * gdn_dim
+                            offset = 2 * gdn_k_dim
                         w_q = _fold_conv_into_proj(w_q, conv_data, m, n, offset)
 
                 self.weight_entries.append((f"layer{i}.{proj}", w_q, m, n))
 
-            # g_proj (output gate — from in_proj_z for GDN, from packed q_proj for attn)
+            # g_proj (in_proj_z for GDN, q_proj second-half for full attn) — gate matches attn output dim.
             gw = weights[f"layer{i}.g_proj"]
-            self.weight_entries.append((f"layer{i}.g_proj", gw.w_q, q_dim, self.config.d_model))
+            self.weight_entries.append((f"layer{i}.g_proj", gw.w_q, attn_out_dim, self.config.d_model))
 
             # MLP projections
             for proj in ['gate_proj', 'up_proj', 'down_proj']:

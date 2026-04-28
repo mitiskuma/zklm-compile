@@ -67,6 +67,8 @@ pub struct LlamaLayerProof {
 pub struct LlamaForwardTrace {
     pub x: Vec<F>,          // original input
     pub norm1_x: Vec<F>,    // possibly perturbed input to RMSNorm 1
+    /// S5: signed perturbation applied to norm1 input.
+    pub norm1_delta: i32,
     pub norm1_out: Vec<F>,
     pub q: Vec<F>,  // (num_q_heads * d_head)
     pub k: Vec<F>,  // (num_kv_heads * d_head)
@@ -75,6 +77,8 @@ pub struct LlamaForwardTrace {
     pub o_proj_out: Vec<F>, // (d_model)
     pub h: Vec<F>,         // x + o_proj_out
     pub norm2_x: Vec<F>,   // possibly perturbed input to RMSNorm 2
+    /// S5: signed perturbation applied to norm2 input.
+    pub norm2_delta: i32,
     pub norm2_out: Vec<F>,
     pub gate_out_raw: Vec<F>, // raw gate matmul output (d_ff)
     pub gate_out: Vec<F>,  // requantized to i16 for SiLU lookup (d_ff)
@@ -99,7 +103,7 @@ pub fn llama_forward(
     let d_head = config.d_head;
 
     // RMSNorm 1
-    let (norm1_out, norm1_x) = rmsnorm_forward(x, &weights.norm1_gamma);
+    let (norm1_out, norm1_x, norm1_delta) = rmsnorm_forward(x, &weights.norm1_gamma);
 
     // QKV projections (independent — run in parallel)
     let q_dim = num_q_heads * d_head;
@@ -131,7 +135,7 @@ pub fn llama_forward(
     let h: Vec<F> = x.iter().zip(o_proj_out.iter()).map(|(&a, &b)| a + b).collect();
 
     // RMSNorm 2
-    let (norm2_out, norm2_x) = rmsnorm_forward(&h, &weights.norm2_gamma);
+    let (norm2_out, norm2_x, norm2_delta) = rmsnorm_forward(&h, &weights.norm2_gamma);
 
     // Gate + Up projections (independent — run in parallel)
     let (gate_out_raw, up_out) = rayon::join(
@@ -157,8 +161,8 @@ pub fn llama_forward(
     let output: Vec<F> = h.iter().zip(down_out.iter()).map(|(&a, &b)| a + b).collect();
 
     LlamaForwardTrace {
-        x: x.to_vec(), norm1_x, norm1_out, q, k, v, attn_out, o_proj_out, h,
-        norm2_x, norm2_out, gate_out_raw, gate_out, gate_silu, up_out, swiglu_out, down_out, output,
+        x: x.to_vec(), norm1_x, norm1_delta, norm1_out, q, k, v, attn_out, o_proj_out, h,
+        norm2_x, norm2_delta, norm2_out, gate_out_raw, gate_out, gate_silu, up_out, swiglu_out, down_out, output,
     }
 }
 
@@ -230,7 +234,7 @@ pub fn prove_llama_layer_with_trace(
     transcript.absorb_bytes(&w_down_commitment.root);
 
     // 1. RMSNorm 1
-    let norm1_proof = prove_rmsnorm(&trace.norm1_x, &weights.norm1_gamma, &trace.norm1_out, transcript);
+    let norm1_proof = prove_rmsnorm(&trace.norm1_x, &weights.norm1_gamma, &trace.norm1_out, trace.norm1_delta, transcript);
 
     // 2. QKV matmuls
     let q_proof = prove_matmul_succinct(&weights.w_q, &trace.norm1_out, &trace.q, q_dim, d_model, None, transcript);
@@ -238,11 +242,16 @@ pub fn prove_llama_layer_with_trace(
     let v_proof = prove_matmul_succinct(&weights.w_v, &trace.norm1_out, &trace.v, kv_dim, d_model, None, transcript);
 
     // 3. Attention (seq_len=1: trivial)
+    // Note (P10-3): Llama path keeps `seq1_consistency: None` for now; the
+    // P10-3 closure is wired into the Qwen path which is
+    // the production proofground. Llama seq_len=1 binding remains
+    // audit-mode-only until the same v↔attn_out helper is hoisted.
     let attn_proof = RowAttentionProof {
         row_proofs: vec![],
         num_heads: config.num_q_heads,
         seq_len: 1,
         d_head: config.d_head,
+        seq1_consistency: None,
     };
 
     // 4. Output projection
@@ -257,7 +266,7 @@ pub fn prove_llama_layer_with_trace(
     let residual1_proof = prove_add(&trace.x, &trace.o_proj_out, &trace.h, &res1_point, transcript);
 
     // 6. RMSNorm 2
-    let norm2_proof = prove_rmsnorm(&trace.norm2_x, &weights.norm2_gamma, &trace.norm2_out, transcript);
+    let norm2_proof = prove_rmsnorm(&trace.norm2_x, &weights.norm2_gamma, &trace.norm2_out, trace.norm2_delta, transcript);
 
     // 7. Gate + Up projections
     let gate_proj_proof = prove_matmul_succinct(
@@ -466,7 +475,7 @@ pub fn prove_llama_layer_ef_with_trace(
     transcript.absorb_bytes(&w_down_commitment.root);
 
     // 1. RMSNorm 1 (EF)
-    let norm1_proof = prove_rmsnorm_ef(&trace.norm1_x, &weights.norm1_gamma, &trace.norm1_out, transcript);
+    let norm1_proof = prove_rmsnorm_ef(&trace.norm1_x, &weights.norm1_gamma, &trace.norm1_out, trace.norm1_delta, transcript);
 
     // 2. QKV matmuls (EF)
     let q_proof = prove_matmul_succinct_ef(&weights.w_q, &trace.norm1_out, &trace.q, q_dim, d_model, None, transcript);
@@ -476,6 +485,7 @@ pub fn prove_llama_layer_ef_with_trace(
     // 3. Attention (seq_len=1: trivial, base-field — same as Qwen EF)
     let attn_proof = RowAttentionProof {
         row_proofs: vec![], num_heads: config.num_q_heads, seq_len: 1, d_head: config.d_head,
+        seq1_consistency: None,
     };
 
     // 4. Output projection (EF)
@@ -489,7 +499,7 @@ pub fn prove_llama_layer_ef_with_trace(
     let residual1_proof = prove_add_ef(&trace.x, &trace.o_proj_out, &trace.h, &res1_point, transcript);
 
     // 6. RMSNorm 2 (EF)
-    let norm2_proof = prove_rmsnorm_ef(&trace.norm2_x, &weights.norm2_gamma, &trace.norm2_out, transcript);
+    let norm2_proof = prove_rmsnorm_ef(&trace.norm2_x, &weights.norm2_gamma, &trace.norm2_out, trace.norm2_delta, transcript);
 
     // 7. Gate + Up projections (EF)
     let gate_proj_proof = prove_matmul_succinct_ef(
@@ -636,7 +646,7 @@ mod tests {
         LookupTable {
             name: "silu_small".to_string(),
             entries,
-            commitment: WeightCommitment { root: [0u8; 32], num_weights: 256, log_height: 8 },
+            commitment: WeightCommitment { root: [0u8; 32], num_weights: 256, log_height: 8, kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast },
         }
     }
 
@@ -691,7 +701,7 @@ mod tests {
             if !is_qr_m31_common(target) { continue; }
 
             // Run forward to check RMSNorm 2
-            let (norm1_out, _) = rmsnorm_forward(&candidate, &weights.norm1_gamma);
+            let (norm1_out, _, _) = rmsnorm_forward(&candidate, &weights.norm1_gamma);
             let q_dim = config.num_q_heads * config.d_head;
             let kv_dim = config.num_kv_heads * config.d_head;
             let _q = matmul_forward(&weights.w_q, &norm1_out, q_dim, config.d_model, None);
@@ -737,6 +747,7 @@ mod tests {
             vocab_size: 8,
             norm_type: NormType::RMSNorm,
             activation: ActivationType::SwiGLU,
+            v_num_heads: 0, v_d_head: 0,
         };
         let silu_table = build_small_silu_table(10);
         let weights = make_llama_weights(&config);
@@ -766,6 +777,7 @@ mod tests {
             vocab_size: 8,
             norm_type: NormType::RMSNorm,
             activation: ActivationType::SwiGLU,
+            v_num_heads: 0, v_d_head: 0,
         };
         let silu_table = build_small_silu_table(10);
         let weights = make_llama_weights(&config);
@@ -793,6 +805,7 @@ mod tests {
             d_model: 8, d_ff: 16, num_q_heads: 4, num_kv_heads: 2,
             d_head: 2, n_layers: 1, vocab_size: 8,
             norm_type: NormType::RMSNorm, activation: ActivationType::SwiGLU,
+            v_num_heads: 0, v_d_head: 0,
         };
         let silu_table = build_small_silu_table(10);
         let weights = make_llama_weights(&config);
@@ -816,6 +829,7 @@ mod tests {
             d_model: 8, d_ff: 16, num_q_heads: 4, num_kv_heads: 2,
             d_head: 2, n_layers: 1, vocab_size: 8,
             norm_type: NormType::RMSNorm, activation: ActivationType::SwiGLU,
+            v_num_heads: 0, v_d_head: 0,
         };
         let silu_table = build_small_silu_table(10);
         let weights = make_llama_weights(&config);

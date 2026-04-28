@@ -15,3 +15,9 @@ pub mod swiglu;
 pub mod softmax;
 pub mod attention;
 pub mod weight_commitment;
+/// P10-7: GDN recurrent-state sumcheck — DESIGN
+/// SCAFFOLD ONLY. The proof STRUCTURE is defined; the prover/verifier
+/// math lands in a focused crypto session, not autonomous /loop work.
+/// See module doc for the full design + open soundness questions.
+#[allow(dead_code)]
+pub mod gdn_recurrence;

@@ -134,3 +134,42 @@ impl ConstraintSynthesizer<Fr> for ZkCompileCircuit {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_relations::r1cs::ConstraintSystem;
+
+    /// SOUNDNESS regression (R8): the bundled
+    /// `examples/square_circuit.json` must continue to deserialize
+    /// against `SerializedCircuit` and produce a satisfied R1CS instance
+    /// (proves x*x = 25, public input 25, private witness x = 5).
+    /// If a future schema refactor breaks the example, the README's
+    /// quickstart instructions silently rot — this test catches that.
+    #[test]
+    fn test_example_square_circuit_loads_and_satisfies() {
+        // Resolve the path relative to the workspace root regardless of
+        // where `cargo test` was invoked from. CARGO_MANIFEST_DIR points
+        // at `rust/zk_compile_prover/`; the example lives at
+        // `<repo>/examples/square_circuit.json`.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = format!("{}/../../examples/square_circuit.json", manifest_dir);
+
+        let circuit = ZkCompileCircuit::from_file(&path)
+            .expect("examples/square_circuit.json must deserialize");
+        assert_eq!(circuit.num_wires, 3);
+        assert_eq!(circuit.num_public_inputs, 1);
+        assert_eq!(circuit.constraints.len(), 1);
+        assert_eq!(circuit.witness, vec!["1".to_string(), "25".to_string(), "5".to_string()]);
+
+        // Synthesize and confirm the constraint system is satisfied.
+        // (Equivalent to what `zk_compile_prover prove` does internally
+        // before running Groth16 setup; if this passes, the example is
+        // a valid R1CS instance.)
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        circuit.generate_constraints(cs.clone())
+            .expect("constraints must synthesize");
+        assert!(cs.is_satisfied().expect("is_satisfied query must succeed"),
+            "examples/square_circuit.json must be a satisfied R1CS instance");
+    }
+}

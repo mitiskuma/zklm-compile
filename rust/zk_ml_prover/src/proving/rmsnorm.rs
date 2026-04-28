@@ -25,7 +25,9 @@ use crate::field::m31_ops::{eq_evals_ef, mle_evaluate_ef};
 use crate::proving::sumcheck::{self, EF, EFElement, SumcheckProof, SumcheckProofEF, Transcript};
 use crate::proving::weight_commitment::{
     commit_weights_fast, prove_mle_eval_no_merkle, prove_mle_eval_no_merkle_ef_base,
-    verify_mle_eval, verify_mle_eval_ef, MleEvalProof, MleEvalProofEF, WeightCommitment,
+    prove_mle_eval_bound, prove_mle_eval_ef_base_bound,
+    verify_mle_eval, verify_mle_eval_ef, verify_mle_eval_bound, verify_mle_eval_ef_bound,
+    MleEvalProof, MleEvalProofEF, WeightCommitment,
 };
 
 type F = Mersenne31;
@@ -33,6 +35,11 @@ type F = Mersenne31;
 /// Proof that y = RMSNorm(x, γ).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RmsNormProof {
+    /// S5: signed perturbation applied to `x[0]` to obtain a quadratic-residue
+    /// `d/sum_sq` (0 if no perturbation was needed). Both prover and verifier
+    /// absorb this onto the main transcript before any sumcheck challenge,
+    /// binding the perturbation choice into Fiat-Shamir.
+    pub perturbation_delta: i32,
     /// Variance check: Σ x[i]² = sum_sq
     pub var_proof: SumcheckProof,
     pub var_finals: (u32, u32), // (x_at_s_a, x_at_s_b)
@@ -82,10 +89,15 @@ pub struct RmsNormProof {
 ///
 /// Uses squared constraint (no sqrt needed in M31):
 /// sum_sq · Σ eq·h² = d · Σ eq·g² where h=y, g=γ·x.
+/// SOUNDNESS (S5): `perturbation_delta` is the signed amount the QR loop in
+/// `rmsnorm_forward` added to the original `x[0]` to obtain a QR sum_sq. It is
+/// absorbed onto the main transcript so any prover/verifier disagreement on
+/// the perturbation choice diverges challenges and fails verification.
 pub fn prove_rmsnorm(
     x: &[F],
     gamma: &[F],
     y: &[F],
+    perturbation_delta: i32,
     transcript: &mut Transcript,
 ) -> RmsNormProof {
     let d = x.len();
@@ -117,6 +129,12 @@ pub fn prove_rmsnorm(
     let g_commitment = commit_weights_fast(&g_pad);
     let h_commitment = commit_weights_fast(&h_pad);
 
+    // S5: absorb perturbation delta first (MUST come before commitments).
+    // SOUNDNESS: binds the QR perturbation amount into the transcript so adversary
+    // cannot swap delta post-hoc. Verifier mirrors this exact ordering.
+    transcript.absorb_bytes(b"rmsnorm-pert-v1");
+    transcript.absorb(perturbation_delta as u32);
+
     // Absorb
     transcript.absorb_bytes(&x_commitment.root);
     transcript.absorb_bytes(&gamma_commitment.root);
@@ -130,9 +148,10 @@ pub fn prove_rmsnorm(
 
     let s_var: Vec<F> = var_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let x_at_var_s = mle_evaluate(&x_pad, &s_var);
-    let mut eval_t1 = Transcript::new(b"rmsnorm-x-var");
-    eval_t1.absorb_bytes(&x_commitment.root);
-    let (_, x_var_eval_proof) = prove_mle_eval_no_merkle(&x_pad, &s_var, &mut eval_t1);
+    // S2: bind inner MLE-eval to main transcript (was fresh Transcript::new).
+    let (_, x_var_eval_proof) = prove_mle_eval_bound(
+        &x_pad, &s_var, b"rmsnorm-x-var", &x_commitment, transcript,
+    );
 
     // --- Step 2: g-consistency check ---
     // Prove Σ eq(ρ,i) · g[i] == Σ eq(ρ,i) · γ[i] · x[i]
@@ -147,9 +166,9 @@ pub fn prove_rmsnorm(
 
     let s_gp: Vec<F> = g_prod_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let g_at_prod_s = mle_evaluate(&g_pad, &s_gp);
-    let mut eval_t2 = Transcript::new(b"rmsnorm-g-prod");
-    eval_t2.absorb_bytes(&g_commitment.root);
-    let (_, g_prod_eval_proof) = prove_mle_eval_no_merkle(&g_pad, &s_gp, &mut eval_t2);
+    let (_, g_prod_eval_proof) = prove_mle_eval_bound(
+        &g_pad, &s_gp, b"rmsnorm-g-prod", &g_commitment, transcript,
+    );
 
     // Triple sumcheck: Σ eq · γ · x = t_g
     let (g_triple_proof, eq_at_gt, gamma_at_gt, x_at_gt) =
@@ -157,13 +176,13 @@ pub fn prove_rmsnorm(
 
     let s_gt: Vec<F> = g_triple_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let x_at_triple_s = mle_evaluate(&x_pad, &s_gt);
-    let mut eval_t3 = Transcript::new(b"rmsnorm-x-triple");
-    eval_t3.absorb_bytes(&x_commitment.root);
-    let (_, x_triple_eval_proof) = prove_mle_eval_no_merkle(&x_pad, &s_gt, &mut eval_t3);
+    let (_, x_triple_eval_proof) = prove_mle_eval_bound(
+        &x_pad, &s_gt, b"rmsnorm-x-triple", &x_commitment, transcript,
+    );
     let gamma_at_triple_s = mle_evaluate(&gamma_pad, &s_gt);
-    let mut eval_t4 = Transcript::new(b"rmsnorm-gamma-triple");
-    eval_t4.absorb_bytes(&gamma_commitment.root);
-    let (_, gamma_triple_eval_proof) = prove_mle_eval_no_merkle(&gamma_pad, &s_gt, &mut eval_t4);
+    let (_, gamma_triple_eval_proof) = prove_mle_eval_bound(
+        &gamma_pad, &s_gt, b"rmsnorm-gamma-triple", &gamma_commitment, transcript,
+    );
 
     // --- Step 3: Squared checks ---
     let sq_point = transcript.squeeze_many(log_n);
@@ -176,9 +195,9 @@ pub fn prove_rmsnorm(
 
     let s_hs: Vec<F> = h_sq_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let h_at_sq_s = mle_evaluate(&h_pad, &s_hs);
-    let mut eval_t5 = Transcript::new(b"rmsnorm-h-sq");
-    eval_t5.absorb_bytes(&h_commitment.root);
-    let (_, h_sq_eval_proof) = prove_mle_eval_no_merkle(&h_pad, &s_hs, &mut eval_t5);
+    let (_, h_sq_eval_proof) = prove_mle_eval_bound(
+        &h_pad, &s_hs, b"rmsnorm-h-sq", &h_commitment, transcript,
+    );
 
     // g-squared: S_g = Σ eq · g · g
     let s_g_val: F = eq_sq.iter().zip(g_pad.iter()).map(|(&e, &g)| e * g * g).sum();
@@ -187,11 +206,12 @@ pub fn prove_rmsnorm(
 
     let s_gs: Vec<F> = g_sq_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
     let g_at_gsq_s = mle_evaluate(&g_pad, &s_gs);
-    let mut eval_t6 = Transcript::new(b"rmsnorm-g-sq");
-    eval_t6.absorb_bytes(&g_commitment.root);
-    let (_, g_sq_eval_proof) = prove_mle_eval_no_merkle(&g_pad, &s_gs, &mut eval_t6);
+    let (_, g_sq_eval_proof) = prove_mle_eval_bound(
+        &g_pad, &s_gs, b"rmsnorm-g-sq", &g_commitment, transcript,
+    );
 
     RmsNormProof {
+        perturbation_delta,
         var_proof,
         var_finals: (x_var_a.as_canonical_u32(), x_var_b.as_canonical_u32()),
         sum_sq_value: sum_sq.as_canonical_u32(),
@@ -245,6 +265,12 @@ pub fn verify_rmsnorm(
     let sum_sq = F::from_canonical_u32(proof.sum_sq_value);
     let d_field = F::from_canonical_u32(d as u32);
 
+    // S5: absorb perturbation delta first (mirror prover, MUST come before commitments).
+    // SOUNDNESS: Binds verifier's transcript to the QR perturbation amount used by prover.
+    // Without this, adversary could swap delta post-hoc and challenges remain valid.
+    transcript.absorb_bytes(b"rmsnorm-pert-v1");
+    transcript.absorb(proof.perturbation_delta as u32);
+
     // Absorb (must match prover)
     transcript.absorb_bytes(&proof.x_commitment.root);
     transcript.absorb_bytes(&proof.gamma_commitment.root);
@@ -266,9 +292,11 @@ pub fn verify_rmsnorm(
     let x_at_var_s = F::from_canonical_u32(proof.x_at_var_s);
     if x_at_var_s != x_var_a { return false; }
     let s_var: Vec<F> = proof.var_proof.challenges.iter().map(|&v| F::from_canonical_u32(v)).collect();
-    let mut eval_t1 = Transcript::new(b"rmsnorm-x-var");
-    eval_t1.absorb_bytes(&proof.x_commitment.root);
-    if !verify_mle_eval(&proof.x_commitment, x_at_var_s, &s_var, &proof.x_var_eval_proof, &mut eval_t1) {
+    // S2: bind to main transcript via verify helper (mirror prover's prove_mle_eval_bound).
+    if !verify_mle_eval_bound(
+        &proof.x_commitment, x_at_var_s, &s_var, &proof.x_var_eval_proof,
+        b"rmsnorm-x-var", transcript,
+    ) {
         eprintln!("RmsNorm: x var MLE eval failed");
         return false;
     }
@@ -294,9 +322,10 @@ pub fn verify_rmsnorm(
     }
     let g_at_prod_s = F::from_canonical_u32(proof.g_at_prod_s);
     if g_at_prod_s != g_at_gp { return false; }
-    let mut eval_t2 = Transcript::new(b"rmsnorm-g-prod");
-    eval_t2.absorb_bytes(&proof.g_commitment.root);
-    if !verify_mle_eval(&proof.g_commitment, g_at_prod_s, &s_gp, &proof.g_prod_eval_proof, &mut eval_t2) {
+    if !verify_mle_eval_bound(
+        &proof.g_commitment, g_at_prod_s, &s_gp, &proof.g_prod_eval_proof,
+        b"rmsnorm-g-prod", transcript,
+    ) {
         eprintln!("RmsNorm: g prod MLE eval failed");
         return false;
     }
@@ -319,17 +348,19 @@ pub fn verify_rmsnorm(
     }
     let x_at_triple_s = F::from_canonical_u32(proof.x_at_triple_s);
     if x_at_triple_s != x_at_gt { return false; }
-    let mut eval_t3 = Transcript::new(b"rmsnorm-x-triple");
-    eval_t3.absorb_bytes(&proof.x_commitment.root);
-    if !verify_mle_eval(&proof.x_commitment, x_at_triple_s, &s_gt, &proof.x_triple_eval_proof, &mut eval_t3) {
+    if !verify_mle_eval_bound(
+        &proof.x_commitment, x_at_triple_s, &s_gt, &proof.x_triple_eval_proof,
+        b"rmsnorm-x-triple", transcript,
+    ) {
         eprintln!("RmsNorm: x triple MLE eval failed");
         return false;
     }
     let gamma_at_triple_s = F::from_canonical_u32(proof.gamma_at_triple_s);
     if gamma_at_triple_s != gamma_at_gt { return false; }
-    let mut eval_t4 = Transcript::new(b"rmsnorm-gamma-triple");
-    eval_t4.absorb_bytes(&proof.gamma_commitment.root);
-    if !verify_mle_eval(&proof.gamma_commitment, gamma_at_triple_s, &s_gt, &proof.gamma_triple_eval_proof, &mut eval_t4) {
+    if !verify_mle_eval_bound(
+        &proof.gamma_commitment, gamma_at_triple_s, &s_gt, &proof.gamma_triple_eval_proof,
+        b"rmsnorm-gamma-triple", transcript,
+    ) {
         eprintln!("RmsNorm: gamma triple MLE eval failed");
         return false;
     }
@@ -361,9 +392,10 @@ pub fn verify_rmsnorm(
     }
     let h_at_sq_s = F::from_canonical_u32(proof.h_at_sq_s);
     if h_at_sq_s != h_at_hs_a { return false; }
-    let mut eval_t5 = Transcript::new(b"rmsnorm-h-sq");
-    eval_t5.absorb_bytes(&proof.h_commitment.root);
-    if !verify_mle_eval(&proof.h_commitment, h_at_sq_s, &s_hs, &proof.h_sq_eval_proof, &mut eval_t5) {
+    if !verify_mle_eval_bound(
+        &proof.h_commitment, h_at_sq_s, &s_hs, &proof.h_sq_eval_proof,
+        b"rmsnorm-h-sq", transcript,
+    ) {
         eprintln!("RmsNorm: h sq MLE eval failed");
         return false;
     }
@@ -399,9 +431,10 @@ pub fn verify_rmsnorm(
     }
     let g_at_gsq_s = F::from_canonical_u32(proof.g_at_gsq_s);
     if g_at_gsq_s != g_at_gs_a { return false; }
-    let mut eval_t6 = Transcript::new(b"rmsnorm-g-sq");
-    eval_t6.absorb_bytes(&proof.g_commitment.root);
-    if !verify_mle_eval(&proof.g_commitment, g_at_gsq_s, &s_gs, &proof.g_sq_eval_proof, &mut eval_t6) {
+    if !verify_mle_eval_bound(
+        &proof.g_commitment, g_at_gsq_s, &s_gs, &proof.g_sq_eval_proof,
+        b"rmsnorm-g-sq", transcript,
+    ) {
         eprintln!("RmsNorm: g sq MLE eval failed");
         return false;
     }
@@ -422,6 +455,8 @@ pub fn verify_rmsnorm(
 /// Proof that y = RMSNorm(x, γ) with extension-field challenges.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RmsNormProofEF {
+    /// S5: signed perturbation applied to `x[0]` (see RmsNormProof).
+    pub perturbation_delta: i32,
     /// Variance check: Σ x[i]² = sum_sq
     pub var_proof: SumcheckProofEF,
     pub var_finals: (EFElement, EFElement), // (x_at_s_a, x_at_s_b)
@@ -471,10 +506,14 @@ pub struct RmsNormProofEF {
 ///
 /// Same algebraic structure as `prove_rmsnorm` but all Fiat-Shamir
 /// challenges are drawn from EF, providing 124-bit soundness.
+///
+/// SOUNDNESS (S5): `perturbation_delta` carries the QR-loop delta and is
+/// absorbed onto the main transcript before any sub-proof.
 pub fn prove_rmsnorm_ef(
     x: &[F],
     gamma: &[F],
     y: &[F],
+    perturbation_delta: i32,
     transcript: &mut Transcript,
 ) -> RmsNormProofEF {
     let d = x.len();
@@ -506,7 +545,10 @@ pub fn prove_rmsnorm_ef(
     let g_commitment = commit_weights_fast(&g_pad);
     let h_commitment = commit_weights_fast(&h_pad);
 
-    // Absorb
+    // S5: absorb perturbation delta onto main transcript (mirror prove_rmsnorm).
+    transcript.absorb_bytes(b"rmsnorm-pert-v1");
+    transcript.absorb(perturbation_delta as u32);
+    // Absorb commitments
     transcript.absorb_bytes(&x_commitment.root);
     transcript.absorb_bytes(&gamma_commitment.root);
     transcript.absorb_bytes(&g_commitment.root);
@@ -520,9 +562,10 @@ pub fn prove_rmsnorm_ef(
 
     let s_var: Vec<EF> = var_proof.challenges.iter().map(|v| v.to_ef()).collect();
     let x_at_var_s = mle_evaluate_ef(&x_pad, &s_var);
-    let mut eval_t1 = Transcript::new(b"rmsnorm-x-var");
-    eval_t1.absorb_bytes(&x_commitment.root);
-    let (_, x_var_eval_proof) = prove_mle_eval_no_merkle_ef_base(&x_pad, &s_var, &mut eval_t1);
+    // S2: bind inner MLE-eval to main transcript (was fresh Transcript::new).
+    let (_, x_var_eval_proof) = prove_mle_eval_ef_base_bound(
+        &x_pad, &s_var, b"rmsnorm-x-var", &x_commitment, transcript,
+    );
 
     // --- Step 2: g-consistency check ---
     let gc_point = transcript.squeeze_ef_many(log_n);
@@ -539,9 +582,9 @@ pub fn prove_rmsnorm_ef(
 
     let s_gp: Vec<EF> = g_prod_proof.challenges.iter().map(|v| v.to_ef()).collect();
     let g_at_prod_s = mle_evaluate_ef(&g_pad, &s_gp);
-    let mut eval_t2 = Transcript::new(b"rmsnorm-g-prod");
-    eval_t2.absorb_bytes(&g_commitment.root);
-    let (_, g_prod_eval_proof) = prove_mle_eval_no_merkle_ef_base(&g_pad, &s_gp, &mut eval_t2);
+    let (_, g_prod_eval_proof) = prove_mle_eval_ef_base_bound(
+        &g_pad, &s_gp, b"rmsnorm-g-prod", &g_commitment, transcript,
+    );
 
     // Triple sumcheck: Σ eq · γ · x = t_g
     // eq_gc is EF, gamma_pad and x_pad are F → convert all to EF, use full-EF
@@ -552,13 +595,13 @@ pub fn prove_rmsnorm_ef(
 
     let s_gt: Vec<EF> = g_triple_proof.challenges.iter().map(|v| v.to_ef()).collect();
     let x_at_triple_s = mle_evaluate_ef(&x_pad, &s_gt);
-    let mut eval_t3 = Transcript::new(b"rmsnorm-x-triple");
-    eval_t3.absorb_bytes(&x_commitment.root);
-    let (_, x_triple_eval_proof) = prove_mle_eval_no_merkle_ef_base(&x_pad, &s_gt, &mut eval_t3);
+    let (_, x_triple_eval_proof) = prove_mle_eval_ef_base_bound(
+        &x_pad, &s_gt, b"rmsnorm-x-triple", &x_commitment, transcript,
+    );
     let gamma_at_triple_s = mle_evaluate_ef(&gamma_pad, &s_gt);
-    let mut eval_t4 = Transcript::new(b"rmsnorm-gamma-triple");
-    eval_t4.absorb_bytes(&gamma_commitment.root);
-    let (_, gamma_triple_eval_proof) = prove_mle_eval_no_merkle_ef_base(&gamma_pad, &s_gt, &mut eval_t4);
+    let (_, gamma_triple_eval_proof) = prove_mle_eval_ef_base_bound(
+        &gamma_pad, &s_gt, b"rmsnorm-gamma-triple", &gamma_commitment, transcript,
+    );
 
     // --- Step 3: Squared checks ---
     let sq_point = transcript.squeeze_ef_many(log_n);
@@ -573,9 +616,9 @@ pub fn prove_rmsnorm_ef(
 
     let s_hs: Vec<EF> = h_sq_proof.challenges.iter().map(|v| v.to_ef()).collect();
     let h_at_sq_s = mle_evaluate_ef(&h_pad, &s_hs);
-    let mut eval_t5 = Transcript::new(b"rmsnorm-h-sq");
-    eval_t5.absorb_bytes(&h_commitment.root);
-    let (_, h_sq_eval_proof) = prove_mle_eval_no_merkle_ef_base(&h_pad, &s_hs, &mut eval_t5);
+    let (_, h_sq_eval_proof) = prove_mle_eval_ef_base_bound(
+        &h_pad, &s_hs, b"rmsnorm-h-sq", &h_commitment, transcript,
+    );
 
     // g-squared: S_g = Σ eq · g · g
     let s_g_val: EF = eq_sq.iter().zip(g_pad.iter()).map(|(&e, &g)| e * f_to_ef(g) * f_to_ef(g)).sum();
@@ -584,11 +627,12 @@ pub fn prove_rmsnorm_ef(
 
     let s_gs: Vec<EF> = g_sq_proof.challenges.iter().map(|v| v.to_ef()).collect();
     let g_at_gsq_s = mle_evaluate_ef(&g_pad, &s_gs);
-    let mut eval_t6 = Transcript::new(b"rmsnorm-g-sq");
-    eval_t6.absorb_bytes(&g_commitment.root);
-    let (_, g_sq_eval_proof) = prove_mle_eval_no_merkle_ef_base(&g_pad, &s_gs, &mut eval_t6);
+    let (_, g_sq_eval_proof) = prove_mle_eval_ef_base_bound(
+        &g_pad, &s_gs, b"rmsnorm-g-sq", &g_commitment, transcript,
+    );
 
     RmsNormProofEF {
+        perturbation_delta,
         var_proof,
         var_finals: (EFElement::from_ef(x_var_a), EFElement::from_ef(x_var_b)),
         sum_sq_value: sum_sq.as_canonical_u32(),
@@ -636,7 +680,10 @@ pub fn verify_rmsnorm_ef(
     let sum_sq_ef = f_to_ef(sum_sq);
     let d_field_ef = f_to_ef(F::from_canonical_u32(d as u32));
 
-    // Absorb (must match prover)
+    // S5: absorb perturbation delta (mirror prove_rmsnorm_ef, MUST come first).
+    transcript.absorb_bytes(b"rmsnorm-pert-v1");
+    transcript.absorb(proof.perturbation_delta as u32);
+    // Absorb commitments (must match prover)
     transcript.absorb_bytes(&proof.x_commitment.root);
     transcript.absorb_bytes(&proof.gamma_commitment.root);
     transcript.absorb_bytes(&proof.g_commitment.root);
@@ -658,9 +705,11 @@ pub fn verify_rmsnorm_ef(
     }
     let x_at_var_s = proof.x_at_var_s.to_ef();
     if x_at_var_s != x_var_a { return false; }
-    let mut eval_t1 = Transcript::new(b"rmsnorm-x-var");
-    eval_t1.absorb_bytes(&proof.x_commitment.root);
-    if !verify_mle_eval_ef(&proof.x_commitment, x_at_var_s, &s_var, &proof.x_var_eval_proof, &mut eval_t1) {
+    // S2: bind to main transcript via verify helper.
+    if !verify_mle_eval_ef_bound(
+        &proof.x_commitment, x_at_var_s, &s_var, &proof.x_var_eval_proof,
+        b"rmsnorm-x-var", transcript,
+    ) {
         eprintln!("RmsNormEF: x var MLE eval failed");
         return false;
     }
@@ -687,9 +736,10 @@ pub fn verify_rmsnorm_ef(
     }
     let g_at_prod_s = proof.g_at_prod_s.to_ef();
     if g_at_prod_s != g_at_gp { return false; }
-    let mut eval_t2 = Transcript::new(b"rmsnorm-g-prod");
-    eval_t2.absorb_bytes(&proof.g_commitment.root);
-    if !verify_mle_eval_ef(&proof.g_commitment, g_at_prod_s, &s_gp, &proof.g_prod_eval_proof, &mut eval_t2) {
+    if !verify_mle_eval_ef_bound(
+        &proof.g_commitment, g_at_prod_s, &s_gp, &proof.g_prod_eval_proof,
+        b"rmsnorm-g-prod", transcript,
+    ) {
         eprintln!("RmsNormEF: g prod MLE eval failed");
         return false;
     }
@@ -713,17 +763,19 @@ pub fn verify_rmsnorm_ef(
     }
     let x_at_triple_s = proof.x_at_triple_s.to_ef();
     if x_at_triple_s != x_at_gt { return false; }
-    let mut eval_t3 = Transcript::new(b"rmsnorm-x-triple");
-    eval_t3.absorb_bytes(&proof.x_commitment.root);
-    if !verify_mle_eval_ef(&proof.x_commitment, x_at_triple_s, &s_gt, &proof.x_triple_eval_proof, &mut eval_t3) {
+    if !verify_mle_eval_ef_bound(
+        &proof.x_commitment, x_at_triple_s, &s_gt, &proof.x_triple_eval_proof,
+        b"rmsnorm-x-triple", transcript,
+    ) {
         eprintln!("RmsNormEF: x triple MLE eval failed");
         return false;
     }
     let gamma_at_triple_s = proof.gamma_at_triple_s.to_ef();
     if gamma_at_triple_s != gamma_at_gt { return false; }
-    let mut eval_t4 = Transcript::new(b"rmsnorm-gamma-triple");
-    eval_t4.absorb_bytes(&proof.gamma_commitment.root);
-    if !verify_mle_eval_ef(&proof.gamma_commitment, gamma_at_triple_s, &s_gt, &proof.gamma_triple_eval_proof, &mut eval_t4) {
+    if !verify_mle_eval_ef_bound(
+        &proof.gamma_commitment, gamma_at_triple_s, &s_gt, &proof.gamma_triple_eval_proof,
+        b"rmsnorm-gamma-triple", transcript,
+    ) {
         eprintln!("RmsNormEF: gamma triple MLE eval failed");
         return false;
     }
@@ -756,9 +808,10 @@ pub fn verify_rmsnorm_ef(
     }
     let h_at_sq_s = proof.h_at_sq_s.to_ef();
     if h_at_sq_s != h_at_hs_a { return false; }
-    let mut eval_t5 = Transcript::new(b"rmsnorm-h-sq");
-    eval_t5.absorb_bytes(&proof.h_commitment.root);
-    if !verify_mle_eval_ef(&proof.h_commitment, h_at_sq_s, &s_hs, &proof.h_sq_eval_proof, &mut eval_t5) {
+    if !verify_mle_eval_ef_bound(
+        &proof.h_commitment, h_at_sq_s, &s_hs, &proof.h_sq_eval_proof,
+        b"rmsnorm-h-sq", transcript,
+    ) {
         eprintln!("RmsNormEF: h sq MLE eval failed");
         return false;
     }
@@ -795,9 +848,10 @@ pub fn verify_rmsnorm_ef(
     }
     let g_at_gsq_s = proof.g_at_gsq_s.to_ef();
     if g_at_gsq_s != g_at_gs_a { return false; }
-    let mut eval_t6 = Transcript::new(b"rmsnorm-g-sq");
-    eval_t6.absorb_bytes(&proof.g_commitment.root);
-    if !verify_mle_eval_ef(&proof.g_commitment, g_at_gsq_s, &s_gs, &proof.g_sq_eval_proof, &mut eval_t6) {
+    if !verify_mle_eval_ef_bound(
+        &proof.g_commitment, g_at_gsq_s, &s_gs, &proof.g_sq_eval_proof,
+        b"rmsnorm-g-sq", transcript,
+    ) {
         eprintln!("RmsNormEF: g sq MLE eval failed");
         return false;
     }
@@ -843,7 +897,7 @@ mod tests {
             let gamma = vec![F::one(); d];
             if let Some(y) = rmsnorm_output(&x, &gamma, d) {
                 let mut pt = Transcript::new(b"rmsnorm-test");
-                let proof = prove_rmsnorm(&x, &gamma, &y, &mut pt);
+                let proof = prove_rmsnorm(&x, &gamma, &y, 0, &mut pt);
                 let mut vt = Transcript::new(b"rmsnorm-test");
                 assert!(verify_rmsnorm(&proof, &y, d, &mut vt), "RMSNorm verification failed");
                 return;
@@ -860,7 +914,7 @@ mod tests {
             let x: Vec<F> = (0..d).map(|i| F::from_canonical_u32(i as u32 + 1 + offset)).collect();
             if let Some(y) = rmsnorm_output(&x, &gamma, d) {
                 let mut pt = Transcript::new(b"rmsnorm-gamma-test");
-                let proof = prove_rmsnorm(&x, &gamma, &y, &mut pt);
+                let proof = prove_rmsnorm(&x, &gamma, &y, 0, &mut pt);
                 let mut vt = Transcript::new(b"rmsnorm-gamma-test");
                 assert!(verify_rmsnorm(&proof, &y, d, &mut vt));
                 return;
@@ -878,7 +932,7 @@ mod tests {
             if let Some(mut y) = rmsnorm_output(&x, &gamma, d) {
                 y[0] = y[0] + F::one(); // tamper
                 let mut pt = Transcript::new(b"rmsnorm-wrong");
-                let proof = prove_rmsnorm(&x, &gamma, &y, &mut pt);
+                let proof = prove_rmsnorm(&x, &gamma, &y, 0, &mut pt);
                 let mut vt = Transcript::new(b"rmsnorm-wrong");
                 assert!(!verify_rmsnorm(&proof, &y, d, &mut vt), "Should reject tampered output");
                 return;
@@ -895,9 +949,41 @@ mod tests {
             let x: Vec<F> = (0..d).map(|i| F::from_canonical_u32(i as u32 * 3 + 1 + offset)).collect();
             if let Some(y) = rmsnorm_output(&x, &gamma, d) {
                 let mut pt = Transcript::new(b"rmsnorm-large");
-                let proof = prove_rmsnorm(&x, &gamma, &y, &mut pt);
+                let proof = prove_rmsnorm(&x, &gamma, &y, 0, &mut pt);
                 let mut vt = Transcript::new(b"rmsnorm-large");
                 assert!(verify_rmsnorm(&proof, &y, d, &mut vt));
+                return;
+            }
+        }
+        panic!("Could not find valid input");
+    }
+
+    /// SOUNDNESS regression (S5): tampering with `perturbation_delta` in a
+    /// valid proof must cause verification to fail. The verifier absorbs the
+    /// delta from the proof onto the main transcript before any sumcheck
+    /// challenge — flipping the delta diverges every downstream challenge,
+    /// so sumcheck verification fails.
+    #[test]
+    fn test_rmsnorm_perturbation_delta_tamper_rejects() {
+        let d = 4;
+        let gamma = vec![F::one(); d];
+        for offset in 0u32..200 {
+            let x: Vec<F> = (0..d).map(|i| F::from_canonical_u32(i as u32 + 1 + offset)).collect();
+            if let Some(y) = rmsnorm_output(&x, &gamma, d) {
+                let mut pt = Transcript::new(b"rmsnorm-pert-tamper");
+                let mut proof = prove_rmsnorm(&x, &gamma, &y, 0, &mut pt);
+
+                // Sanity: untampered proof verifies.
+                let mut vt = Transcript::new(b"rmsnorm-pert-tamper");
+                assert!(verify_rmsnorm(&proof, &y, d, &mut vt));
+
+                // Tamper: bump delta from 0 to 1.
+                proof.perturbation_delta = 1;
+                let mut vt2 = Transcript::new(b"rmsnorm-pert-tamper");
+                assert!(
+                    !verify_rmsnorm(&proof, &y, d, &mut vt2),
+                    "verifier accepted proof with tampered perturbation_delta"
+                );
                 return;
             }
         }
@@ -912,7 +998,7 @@ mod tests {
             let x: Vec<F> = (0..d).map(|i| F::from_canonical_u32(i as u32 + 1 + offset)).collect();
             if let Some(y) = rmsnorm_output(&x, &gamma, d) {
                 let mut pt = Transcript::new(b"rmsnorm-ef-test");
-                let proof = prove_rmsnorm_ef(&x, &gamma, &y, &mut pt);
+                let proof = prove_rmsnorm_ef(&x, &gamma, &y, 0, &mut pt);
                 let mut vt = Transcript::new(b"rmsnorm-ef-test");
                 assert!(verify_rmsnorm_ef(&proof, &y, d, &mut vt), "RMSNorm EF verification should pass");
                 return;

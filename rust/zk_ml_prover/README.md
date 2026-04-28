@@ -12,7 +12,12 @@ Qwen3.5-0.8B (24 layers, 800M parameters) on Apple M4 Max:
 | `--features pcs` | **134ms** | 20ms | 56MB | 124 + 219-bit (Basefold) | Basefold on w_partial |
 | `--features pcs-full` | **14.3s** | 683ms | 391MB | 124 + 219-bit (Basefold) | Full standalone verification |
 
-GPT-2 (12 layers, 117M parameters): **62ms** prove.
+GPT-2 (12 layers, 124M parameters): **~253ms** prove (EF default,
+M4 Max, April 2026 re-measurement; 3-run avg 248–260ms). Verify
+**5.16ms**, proof **963KB**, 182/182 ops proved (100% coverage including
+attention + GELU + LayerNorm). The pre-EF-default snapshot recorded
+~62ms with base-field challenges; the EF default trades ~4× prove time
+for 124-bit-per-round soundness.
 
 ## Soundness
 
@@ -144,7 +149,7 @@ Field-agnostic polynomial commitment scheme over Mersenne-31, following [Zeilber
 |--------|-------|-------|--------|-------|-----|
 | **ZK-Compile** | Qwen3.5-0.8B (800M) | **92ms** | 16ms | 4.7MB | Fiat-Shamir |
 | **ZK-Compile (pcs-full)** | Qwen3.5-0.8B (800M) | **14.3s** | 683ms | 391MB | Basefold |
-| **ZK-Compile** | GPT-2 (117M) | **62ms** | — | — | Fiat-Shamir |
+| **ZK-Compile** | GPT-2 (124M, 12 layers) | **253ms** (EF default) | 5.16ms | 963KB | Fiat-Shamir |
 | Deep-Prove | MLP (4M) | 2,335ms | 520ms | — | Basefold |
 | Deep-Prove | CNN (264K) | 1,242ms | 599ms | — | Basefold |
 | EZKL | MNIST MLP | ~1,310s | 5.4s | 127KB | Halo2/KZG |

@@ -1,0 +1,7 @@
+# R2: pin the Rust toolchain so reproducible builds
+# work on a fresh checkout. Match the version baseline from the Dockerfile
+# (1.85+) so dependencies that require edition-2024 features compile.
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

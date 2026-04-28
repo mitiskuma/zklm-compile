@@ -10,7 +10,10 @@ build/
 
 # Rust
 target/
-Cargo.lock
+# Cargo.lock is committed for both binary crates (R1 — funding-readiness):
+# reproducible benchmarks require pinned dependency versions. Library
+# crates would still gitignore Cargo.lock; both Rust crates here are
+# binaries (zk_ml_prover, zk_compile_prover).
 
 # IDE
 .idea/
@@ -44,3 +47,4 @@ circuit.json
 
 # Claude
 .claude/
+bench/work/

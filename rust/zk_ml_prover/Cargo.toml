@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Fast verifiable inference for large language models via structured sumcheck and Basefold PCS over Mersenne-31"
-repository = "https://github.com/niclas-4/zk-ml-prover"
+repository = "https://github.com/mitiskuma/zklm-compile"
 authors = ["mitiskuma"]
 
 [features]
@@ -36,5 +36,35 @@ itertools = "0.12"
 rayon = "1.10"
 metal = { version = "0.33", optional = true }
 
+[dev-dependencies]
+# Phase 11 (P11-2/P11-3/P11-5): proptest-driven property + invariant tests.
+# Pinned at 1.4 to match the rest of the dependency graph; bump on Plonky3
+# upgrades.
+proptest = "1.4"
+
 [profile.release]
 opt-level = 3
+
+# Phase 11 integration tests live under `rust/zk_ml_prover/tests/`.
+# Cargo auto-discovers `tests/<name>.rs`; we use directory-style modules
+# for the property and tamper matrix tests so each can have helper files.
+[[test]]
+name = "phase11_mle_relations"
+path = "tests/property/mle_relations.rs"
+
+[[test]]
+name = "phase11_proptest_harness"
+path = "tests/property/harness.rs"
+
+[[test]]
+name = "phase11_quantization_invariants"
+path = "tests/property/quantization_invariants.rs"
+
+[[test]]
+name = "phase11_tamper_matrix"
+path = "tests/tamper_matrix/main.rs"
+
+# P10-7: GDN recurrence audit-mode cross-language harness.
+[[test]]
+name = "p10_7_gdn_recurrence_harness"
+path = "tests/property/harness_gdn_recurrence.rs"

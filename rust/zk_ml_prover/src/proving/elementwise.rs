@@ -16,7 +16,9 @@ use crate::field::m31_ops::*;
 use crate::proving::sumcheck::{self, EF, EFElement, SumcheckProof, SumcheckProofEF, Transcript};
 use crate::proving::weight_commitment::{
     commit_weights_fast, prove_mle_eval_no_merkle, prove_mle_eval_no_merkle_ef_base,
-    verify_mle_eval, verify_mle_eval_ef, MleEvalProof, MleEvalProofEF, WeightCommitment,
+    prove_mle_eval_bound, prove_mle_eval_ef_base_bound,
+    verify_mle_eval, verify_mle_eval_ef, verify_mle_eval_bound, verify_mle_eval_ef_bound,
+    MleEvalProof, MleEvalProofEF, WeightCommitment,
 };
 
 type F = Mersenne31;
@@ -77,10 +79,10 @@ pub fn prove_hadamard(
     // The sumcheck claimed sum is c̃(r)
     let c_eval = mle_evaluate(&c_pad, point);
 
-    // MLE eval proof: prove c̃(r) = c_eval against c_commitment
-    let mut eval_transcript = Transcript::new(b"hadamard-c-eval");
-    eval_transcript.absorb_bytes(&c_commitment.root);
-    let (_, c_eval_proof) = prove_mle_eval_no_merkle(&c_pad, point, &mut eval_transcript);
+    // S2: bind inner MLE-eval to main transcript (was fresh Transcript::new).
+    let (_, c_eval_proof) = prove_mle_eval_bound(
+        &c_pad, point, b"hadamard-c-eval", &c_commitment, transcript,
+    );
 
     HadamardProof {
         product_sumcheck,
@@ -141,15 +143,14 @@ pub fn verify_hadamard(
         return false;
     }
 
-    // Verify c̃(r) = c_eval via MLE eval proof
-    let mut eval_transcript = Transcript::new(b"hadamard-c-eval");
-    eval_transcript.absorb_bytes(&proof.c_commitment.root);
-    if !verify_mle_eval(
+    // S2: verify MLE eval bound to main transcript.
+    if !verify_mle_eval_bound(
         &proof.c_commitment,
         c_eval,
         point,
         &proof.c_eval_proof,
-        &mut eval_transcript,
+        b"hadamard-c-eval",
+        transcript,
     ) {
         return false;
     }
@@ -217,10 +218,10 @@ pub fn prove_add(
 
     let c_eval = mle_evaluate(&c_pad, point);
 
-    // MLE eval proof for c̃(r)
-    let mut eval_transcript = Transcript::new(b"add-c-eval");
-    eval_transcript.absorb_bytes(&c_commitment.root);
-    let (_, c_eval_proof) = prove_mle_eval_no_merkle(&c_pad, point, &mut eval_transcript);
+    // S2: bind inner MLE-eval to main transcript.
+    let (_, c_eval_proof) = prove_mle_eval_bound(
+        &c_pad, point, b"add-c-eval", &c_commitment, transcript,
+    );
 
     AddProof {
         a_sumcheck,
@@ -287,15 +288,14 @@ pub fn verify_add(
         return false;
     }
 
-    // Verify c MLE eval proof
-    let mut eval_transcript = Transcript::new(b"add-c-eval");
-    eval_transcript.absorb_bytes(&proof.c_commitment.root);
-    if !verify_mle_eval(
+    // S2: verify MLE eval bound to main transcript.
+    if !verify_mle_eval_bound(
         &proof.c_commitment,
         c_eval,
         point,
         &proof.c_eval_proof,
-        &mut eval_transcript,
+        b"add-c-eval",
+        transcript,
     ) {
         return false;
     }
@@ -461,10 +461,10 @@ pub fn prove_hadamard_ef(
     // c̃(r) in EF: base-field c evaluated at EF point
     let c_eval = mle_evaluate_ef(&c_pad, point);
 
-    // MLE eval proof: prove c̃(r) = c_eval against c_commitment
-    let mut eval_transcript = Transcript::new(b"hadamard-c-eval-ef");
-    eval_transcript.absorb_bytes(&c_commitment.root);
-    let (_, c_eval_proof) = prove_mle_eval_no_merkle_ef_base(&c_pad, point, &mut eval_transcript);
+    // S2: bind inner MLE-eval to main transcript.
+    let (_, c_eval_proof) = prove_mle_eval_ef_base_bound(
+        &c_pad, point, b"hadamard-c-eval-ef", &c_commitment, transcript,
+    );
 
     HadamardProofEF {
         product_sumcheck,
@@ -506,15 +506,14 @@ pub fn verify_hadamard_ef(
         return false;
     }
 
-    // Verify c̃(r) = c_eval via MLE eval proof
-    let mut eval_transcript = Transcript::new(b"hadamard-c-eval-ef");
-    eval_transcript.absorb_bytes(&proof.c_commitment.root);
-    if !verify_mle_eval_ef(
+    // S2: verify MLE eval bound to main transcript.
+    if !verify_mle_eval_ef_bound(
         &proof.c_commitment,
         c_eval,
         point,
         &proof.c_eval_proof,
-        &mut eval_transcript,
+        b"hadamard-c-eval-ef",
+        transcript,
     ) {
         return false;
     }
@@ -579,10 +578,10 @@ pub fn prove_add_ef(
 
     let c_eval = mle_evaluate_ef(&c_pad, point);
 
-    // MLE eval proof for c̃(r)
-    let mut eval_transcript = Transcript::new(b"add-c-eval-ef");
-    eval_transcript.absorb_bytes(&c_commitment.root);
-    let (_, c_eval_proof) = prove_mle_eval_no_merkle_ef_base(&c_pad, point, &mut eval_transcript);
+    // S2: bind inner MLE-eval to main transcript.
+    let (_, c_eval_proof) = prove_mle_eval_ef_base_bound(
+        &c_pad, point, b"add-c-eval-ef", &c_commitment, transcript,
+    );
 
     AddProofEF {
         a_sumcheck,
@@ -629,15 +628,14 @@ pub fn verify_add_ef(
         return false;
     }
 
-    // Verify c MLE eval proof
-    let mut eval_transcript = Transcript::new(b"add-c-eval-ef");
-    eval_transcript.absorb_bytes(&proof.c_commitment.root);
-    if !verify_mle_eval_ef(
+    // S2: verify MLE eval bound to main transcript.
+    if !verify_mle_eval_ef_bound(
         &proof.c_commitment,
         c_eval,
         point,
         &proof.c_eval_proof,
-        &mut eval_transcript,
+        b"add-c-eval-ef",
+        transcript,
     ) {
         return false;
     }

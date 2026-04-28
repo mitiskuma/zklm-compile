@@ -1,0 +1,12 @@
+{
+  "_comment": "R8 (funding-readiness): minimal smoke-test circuit. Proves knowledge of `x` such that `x*x = 25` over BN254. Public input is 25 (wire 1); private witness is x = 5 (wire 2). Wire 0 is the constant 1.",
+  "field": "bn254",
+  "field_modulus": "21888242871839275222246405745257275088548364400416034343698204186575808495617",
+  "num_wires": 3,
+  "num_public_inputs": 1,
+  "num_constraints": 1,
+  "constraints": [
+    {"a": {"2": "1"}, "b": {"2": "1"}, "c": {"1": "1"}}
+  ],
+  "witness": ["1", "25", "5"]
+}

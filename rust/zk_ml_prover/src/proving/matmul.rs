@@ -298,6 +298,7 @@ fn bind_weights(
                 root,
                 num_weights: bf_commitment.num_coeffs,
                 log_height: bf_commitment.log_n,
+                kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast,
             },
             eval_proof: MleEvalProof {
                 eval_sumcheck: SumcheckProof { round_polys: vec![], challenges: vec![] },
@@ -396,6 +397,7 @@ fn bind_weights_ef(
                 root,
                 num_weights: bf_commitment.num_coeffs,
                 log_height: bf_commitment.log_n,
+                kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast,
             }
         }, Some(bf_proof))
     } else {
@@ -411,6 +413,7 @@ fn bind_weights_ef(
                 root,
                 num_weights: bf_commitment.num_coeffs,
                 log_height: bf_commitment.log_n,
+                kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast,
             }
         }, Some(bf_proof))
     };
@@ -429,6 +432,7 @@ fn bind_weights_ef(
                 root,
                 num_weights: bf_commitment.num_coeffs,
                 log_height: bf_commitment.log_n,
+                kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast,
             }
         }, Some(bf_proof))
     };

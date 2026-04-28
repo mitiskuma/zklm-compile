@@ -97,11 +97,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install numpy + smoke-check reference shim
+      - name: Install numpy + blake3 + smoke-check reference shim
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install numpy
-          python3 -c "import numpy; print('numpy', numpy.__version__)"
+          python3 -m pip install numpy blake3
+          python3 -c "import numpy, blake3; print('numpy', numpy.__version__, 'blake3 ok')"
 
       - name: cargo build --release (default features)
         working-directory: rust/zk_ml_prover
@@ -199,11 +199,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install numpy + smoke-check reference shim
+      - name: Install numpy + blake3 + smoke-check reference shim
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install numpy
-          python3 -c "import numpy; print('numpy', numpy.__version__)"
+          python3 -m pip install numpy blake3
+          python3 -c "import numpy, blake3; print('numpy', numpy.__version__, 'blake3 ok')"
 
       # Run only the four phase11_* integration test targets at 10k
       # cases. Skipping unit tests / pcs smoke keeps the soak focused on

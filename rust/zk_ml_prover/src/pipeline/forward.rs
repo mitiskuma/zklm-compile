@@ -654,6 +654,7 @@ pub(super) fn forward_pass_all_ops(
                     num_q_heads: lc.num_q_heads, num_kv_heads: lc.num_kv_heads,
                     d_head: lc.d_head, n_layers: 1, vocab_size: 0,
                     norm_type: NormType::RMSNorm, activation: ActivationType::SwiGLU,
+                    v_num_heads: 0, v_d_head: 0,  // Llama: symmetric → fall back to num_kv_heads/d_head
                 };
                 // Weights are already Vec<F> — move directly, no conversion or cloning
                 let weights = LlamaLayerWeights {
@@ -697,6 +698,7 @@ pub(super) fn forward_pass_all_ops(
                     num_q_heads: qc.num_q_heads, num_kv_heads: qc.num_kv_heads,
                     d_head: qc.d_head, n_layers: 1, vocab_size: 0,
                     norm_type: NormType::RMSNorm, activation: ActivationType::SwiGLU,
+                    v_num_heads: qc.v_num_heads, v_d_head: qc.v_d_head,
                 };
                 let weights = QwenLayerWeights {
                     norm1_gamma: qw.norm1_gamma, w_q: qw.w_q, w_k: qw.w_k, w_v: qw.w_v,

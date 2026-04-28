@@ -76,6 +76,86 @@ class TestConv1DFolding(unittest.TestCase):
         expected = np.array([3, 6, 20, 24], dtype=np.uint32)
         np.testing.assert_array_equal(result, expected)
 
+    def test_fold_causal_tap_distinguishes_first_and_last(self):
+        """G1 — the convention parameter must select
+        a different tap when the kernel has heterogeneous weights. If the
+        two branches produced the same output, a future refactor could
+        silently flip the default and we'd never know.
+
+        Build a kernel whose first and last taps are very different
+        (1.0 and 5.0 respectively); fold once with the historical
+        ``causal_tap_index=0`` and once with the PyTorch-standard
+        ``causal_tap_index=-1`` and assert the results differ.
+        """
+        rows, cols = 1, 2
+        w_m31 = np.array([2, 3], dtype=np.uint32)  # 1 row x 2 cols
+
+        conv_weight = np.zeros((rows, 1, 4), dtype=np.float32)
+        conv_weight[0, 0, 0] = 1.0   # first tap
+        conv_weight[0, 0, 3] = 5.0   # last tap (k = K-1 = 3)
+
+        first_tap = _fold_conv_into_proj(w_m31, conv_weight, rows, cols, 0,
+                                          causal_tap_index=0)
+        last_tap = _fold_conv_into_proj(w_m31, conv_weight, rows, cols, 0,
+                                         causal_tap_index=-1)
+
+        # First-tap fold scales by 1.0 → unchanged.
+        np.testing.assert_array_equal(first_tap, np.array([2, 3], dtype=np.uint32))
+        # Last-tap fold scales by 5.0 → multiplied by 5.
+        np.testing.assert_array_equal(last_tap, np.array([10, 15], dtype=np.uint32))
+        # The two branches must produce distinct outputs.
+        self.assertFalse(np.array_equal(first_tap, last_tap),
+                         "causal_tap_index branches must select different kernel positions")
+
+    def test_fold_causal_tap_out_of_range_raises(self):
+        """Out-of-range tap indices must raise IndexError (defensive)."""
+        rows, cols = 1, 2
+        w_m31 = np.array([1, 2], dtype=np.uint32)
+        conv_weight = np.ones((rows, 1, 4), dtype=np.float32)
+        with self.assertRaises(IndexError):
+            _fold_conv_into_proj(w_m31, conv_weight, rows, cols, 0,
+                                  causal_tap_index=4)
+        with self.assertRaises(IndexError):
+            _fold_conv_into_proj(w_m31, conv_weight, rows, cols, 0,
+                                  causal_tap_index=-5)
+
+    def test_fold_post_silu_is_dropped_pinning(self):
+        """G2 — pin that the static fold drops the
+        post-Conv1D SiLU. The real Qwen3.5 GDN forward pass is
+        ``silu(conv1d(in_proj(x)))``; our fold captures ``conv1d(in_proj(x))``
+        only. This test demonstrates the approximation explicitly: fold
+        a known scale and confirm the output is the LINEAR product, not
+        the SiLU-applied product.
+
+        If a future commit adds a SiLU layer between the folded matmul
+        and Q/K/V (the real fix), this test will fail and force a
+        coordinated roadmap status update — preventing silent rotation.
+        """
+        rows, cols = 1, 1
+        # Choose w * scale = 8 so silu(8) ≈ 7.997 differs from 8 enough
+        # that a SiLU-applied path would round to 7 (or 8 minus a small
+        # correction depending on quantization), distinguishing it from
+        # the pure linear fold.
+        w_signed = np.array([4], dtype=np.int64)
+        w_m31 = w_signed.astype(np.uint32)
+
+        conv_weight = np.full((rows, 1, 4), 2.0, dtype=np.float32)
+
+        result = _fold_conv_into_proj(w_m31, conv_weight, rows, cols, 0)
+        # Pure linear fold: 4 * 2.0 = 8 → M31 element 8.
+        np.testing.assert_array_equal(result, np.array([8], dtype=np.uint32))
+
+        # Sanity: confirm SiLU(8.0) ≠ 8 so a future SiLU-aware fold
+        # would produce a different result than this test asserts.
+        # SiLU(x) = x * sigmoid(x); SiLU(8) ≈ 7.9973 in float.
+        silu_8 = 8.0 * (1.0 / (1.0 + np.exp(-8.0)))
+        self.assertLess(silu_8, 8.0,
+                        "SiLU(8) is strictly less than 8 — proves a "
+                        "post-SiLU fold would round to a different value")
+        self.assertGreater(silu_8, 7.99,
+                           "SiLU(8) is close enough to 8 that quantization "
+                           "to int rounds it to a near-but-distinct value")
+
 
 class TestToM31(unittest.TestCase):
     """Test signed-to-M31 conversion."""

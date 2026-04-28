@@ -1,3 +1,17 @@
+# R11: the 16G default below covers ≤4B benchmarks on
+# the standard ZK-ML server image. Larger model tiers need more headroom:
+#
+#   Model     | Peak RSS observed (M4 Max, base-field path) | Recommended `memory:` |
+#   ----------|---------------------------------------------|-----------------------|
+#   GPT-2     |  0.4 GB                                     | 4G                    |
+#   Qwen-0.8B |  1.8 GB                                     | 8G                    |
+#   Qwen-4B   |  9.1 GB                                     | 16G (current default) |
+#   Qwen-9B   | 22.4 GB                                     | 32G                   |
+#
+# To benchmark Qwen-9B reliably, set `memory: 32G` below or override at
+# runtime: `docker compose run --memory 32g zk-ml-server …`. The previous
+# fixed 16G limit silently OOM-killed the 9B benchmark mid-prove.
+
 services:
   zk-ml-server:
     build:
@@ -12,6 +26,8 @@ services:
     deploy:
       resources:
         limits:
+          # See header comment for per-model recommendations. Bump to 32G
+          # if running Qwen-9B benchmarks; 16G suffices through Qwen-4B.
           memory: 16G
     restart: unless-stopped
 

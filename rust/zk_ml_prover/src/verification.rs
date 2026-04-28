@@ -21,7 +21,7 @@ use crate::transformer::{
     verify_qwen_layer_ef,
 };
 use crate::proving::weight_commitment::{
-    verify_mle_eval, WeightCommitment,
+    verify_mle_eval, verify_mle_eval_bound, WeightCommitment,
 };
 use crate::protocol::*;
 
@@ -39,7 +39,15 @@ pub(crate) fn run_verify_mode(proof_path: &str) {
         let bytes = hex::decode(hex_str).expect("invalid hex in weight_commitment");
         root.copy_from_slice(&bytes);
         // Count linear ops for num_weights (approximate — we just need the root for verification)
-        WeightCommitment { root, num_weights: 0, log_height: 0 }
+        // E8: serialized proofs predate the discriminant, so use Blake3Fast
+        // (the historical commit_weights_fast default). Future proofs will
+        // round-trip the explicit `kind` via serde.
+        WeightCommitment {
+            root,
+            num_weights: 0,
+            log_height: 0,
+            kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast,
+        }
     }).collect();
 
     // Reconstruct input values from layer_meta (first layer's input is not stored, use hash)
@@ -284,14 +292,14 @@ pub(crate) fn verify_full_proof(
                         eprintln!("Chain value mismatch at ReLU {}", meta.name);
                         return false;
                     }
-                    let mut chain_transcript = Transcript::new(b"relu-chain");
-                    chain_transcript.absorb_bytes(&a_commitment.root);
-                    if !verify_mle_eval(
+                    // S2: bind to main transcript via verify helper.
+                    if !verify_mle_eval_bound(
                         a_commitment,
                         chain_val,
                         claim_point,
                         chain_proof,
-                        &mut chain_transcript,
+                        b"relu-chain",
+                        &mut transcript,
                     ) {
                         eprintln!("Chain MLE eval proof failed at ReLU {}", meta.name);
                         return false;
@@ -304,14 +312,14 @@ pub(crate) fn verify_full_proof(
                 let r_point = transcript.squeeze_many(log_n);
 
                 let a_at_r = F::from_canonical_u32(*a_at_r_raw);
-                let mut eval_transcript = Transcript::new(b"relu-eval");
-                eval_transcript.absorb_bytes(&a_commitment.root);
-                if !verify_mle_eval(
+                // S2: bind to main transcript via verify helper.
+                if !verify_mle_eval_bound(
                     a_commitment,
                     a_at_r,
                     &r_point,
                     a_eval_proof,
-                    &mut eval_transcript,
+                    b"relu-eval",
+                    &mut transcript,
                 ) {
                     eprintln!("Layer {} ReLU a_at_r eval proof failed", meta.name);
                     return false;

@@ -30,9 +30,11 @@ class ModelConfig:
     model_type: str  # "gpt2", "llama", "mistral", "qwen2", "qwen3", "qwen3_5"
     layer_types: Optional[List[str]] = None  # per-layer type, e.g. ["gdn", "gdn", "gdn", "attn", ...]
     sigmoid_scale: int = 1000  # scale for sigmoid lookup (output gating)
-    # GDN-specific config (may differ from full attention head config)
-    gdn_num_heads: int = 0     # GDN head count (e.g. 16)
-    gdn_d_head: int = 0        # GDN head dim (e.g. 128)
+    # GDN-specific config. K dim and V dim may differ (Qwen3.5-4B: V = 2*K).
+    gdn_num_heads: int = 0      # GDN K/Q head count (e.g. 16)
+    gdn_d_head: int = 0         # GDN K/Q head dim (e.g. 128)
+    gdn_v_num_heads: int = 0    # GDN V head count (often == gdn_num_heads but not always)
+    gdn_v_d_head: int = 0       # GDN V head dim
 
 
 @dataclass
@@ -121,6 +123,9 @@ def detect_model_config(hf_config) -> ModelConfig:
 
         gdn_num_heads = getattr(tc, 'linear_num_key_heads', 16)
         gdn_d_head = getattr(tc, 'linear_key_head_dim', 128)
+        # V may have different head config (e.g. Qwen3.5-4B: 32 v-heads vs 16 k-heads)
+        gdn_v_num_heads = getattr(tc, 'linear_num_value_heads', gdn_num_heads)
+        gdn_v_d_head = getattr(tc, 'linear_value_head_dim', gdn_d_head)
 
         return ModelConfig(
             d_model=tc.hidden_size,
@@ -136,9 +141,131 @@ def detect_model_config(hf_config) -> ModelConfig:
             layer_types=layer_types_config,
             gdn_num_heads=gdn_num_heads,
             gdn_d_head=gdn_d_head,
+            gdn_v_num_heads=gdn_v_num_heads,
+            gdn_v_d_head=gdn_v_d_head,
         )
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
+
+
+def _resolve_local_snapshot(model_name_or_path: str):
+    """Find a local HF cache snapshot dir for `org/model`, else return path
+    if it's already a local directory.
+
+    Used by `_load_via_safetensors_direct` to bypass `AutoModel` for
+    architectures that the installed `transformers` doesn't recognize
+    (e.g. `qwen3_5` on transformers <= 4.57.6 — see 
+    benchmark re-run notes)."""
+    import os
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
+    # HF cache layout: ~/.cache/huggingface/hub/models--<org>--<name>/snapshots/<sha>/
+    cache_root = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface/hub")
+    folder = "models--" + model_name_or_path.replace("/", "--")
+    snap_root = os.path.join(cache_root, folder, "snapshots")
+    if not os.path.isdir(snap_root):
+        return None
+    snaps = sorted(os.listdir(snap_root))
+    if not snaps:
+        return None
+    return os.path.join(snap_root, snaps[-1])
+
+
+def _load_via_safetensors_direct(snapshot_dir: str, dtype=None):
+    """Load `(config_namespace, state_dict)` directly from a HF snapshot
+    without going through `AutoModel`. Returns a `(SimpleNamespace, dict)`
+    pair that mimics the surface area `ModelExtractor` consumes.
+
+    SAFETY (benchmark re-run): this path exists
+    specifically for `qwen3_5` checkpoints where the installed
+    `transformers` lacks the architecture class. It reads config.json
+    as a nested `SimpleNamespace` (to match `hf_config.text_config.X`
+    attribute access) and loads safetensors shards via `safetensors.torch`.
+    Weights are kept in the file's stored dtype unless `dtype` is
+    explicitly passed; the rest of the pipeline calls `.float().numpy()`
+    on each tensor, so the in-memory dtype only affects peak RSS during
+    extraction."""
+    import json
+    import os
+    import torch
+    from types import SimpleNamespace
+    from safetensors.torch import load_file
+
+    config_path = os.path.join(snapshot_dir, "config.json")
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+
+    def _to_namespace(obj):
+        if isinstance(obj, dict):
+            return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
+        if isinstance(obj, list):
+            return [_to_namespace(x) for x in obj]
+        return obj
+
+    cfg_ns = _to_namespace(config_dict)
+
+    # Discover all safetensors shards in the snapshot dir. The
+    # safetensors.index.json lists which key lives in which shard, but
+    # we just slurp every file and merge — same result, simpler code.
+    raw_state_dict = {}
+    shard_files = sorted(
+        f for f in os.listdir(snapshot_dir)
+        if f.endswith(".safetensors")
+    )
+    if not shard_files:
+        raise RuntimeError(
+            f"No .safetensors shards found in {snapshot_dir}; cannot bypass AutoModel"
+        )
+    for shard in shard_files:
+        shard_path = os.path.join(snapshot_dir, shard)
+        loaded = load_file(shard_path, device="cpu")
+        if dtype is not None:
+            loaded = {k: v.to(dtype) for k, v in loaded.items()}
+        raw_state_dict.update(loaded)
+
+    # SHAPE NORMALIZATION (benchmark re-run): Qwen3.5-VLM
+    # checkpoints store the text backbone under `model.language_model.*` and
+    # extra heads under `mtp.*` / `model.visual.*`. The extractor's
+    # `_extract_qwen35_style` was written against the AutoModel-loaded view
+    # which strips the `language_model` indirection, so we replicate that
+    # here:
+    #   - `model.language_model.X` → `model.X`
+    #   - skip `model.visual.*` (vision encoder, not part of the text proof)
+    #   - skip `mtp.*` (multi-token prediction head, not used at inference)
+    # Tied embeddings: when `tie_word_embeddings: true` (Qwen3.5 default), the
+    # checkpoint omits `lm_head.weight`; we synthesize it as a view onto
+    # `embed_tokens.weight` so the extractor's lm_head lookup succeeds.
+    state_dict = {}
+    for k, v in raw_state_dict.items():
+        if k.startswith("model.visual.") or k.startswith("mtp."):
+            continue
+        if k.startswith("model.language_model."):
+            new_k = "model." + k[len("model.language_model."):]
+        else:
+            new_k = k
+        state_dict[new_k] = v
+
+    tie_word_embeddings = bool(getattr(cfg_ns, "tie_word_embeddings", False)) or \
+        bool(getattr(getattr(cfg_ns, "text_config", cfg_ns), "tie_word_embeddings", False))
+    if "lm_head.weight" not in state_dict and tie_word_embeddings:
+        embed_key = "model.embed_tokens.weight"
+        if embed_key in state_dict:
+            state_dict["lm_head.weight"] = state_dict[embed_key]
+
+    return cfg_ns, state_dict
+
+
+class _StaticStateDictModel:
+    """Minimal `nn.Module`-shaped stand-in for the bits of `self.model`
+    that `ModelExtractor` touches: just `.state_dict()` and `.eval()`.
+
+    Used when `_load_via_safetensors_direct` is the loading path."""
+    def __init__(self, sd):
+        self._sd = sd
+    def state_dict(self):
+        return self._sd
+    def eval(self):
+        return self
 
 
 class ModelExtractor:
@@ -149,16 +276,42 @@ class ModelExtractor:
         from transformers import AutoModelForCausalLM, AutoConfig
 
         self.model_name = model_name_or_path
-        hf_config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
-        self.config = detect_model_config(hf_config)
-
-        # Load model (use float32 for quantization accuracy)
         load_dtype = dtype or torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            dtype=load_dtype,
-            trust_remote_code=True,
-        )
+
+        # Fast path: try AutoConfig + AutoModel. Falls back to a direct
+        # safetensors load when the installed `transformers` doesn't
+        # know the architecture (e.g. qwen3_5 on transformers <= 4.57.6).
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                model_name_or_path, trust_remote_code=True,
+            )
+            self.config = detect_model_config(hf_config)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                dtype=load_dtype,
+                trust_remote_code=True,
+            )
+            self.model.eval()
+            return
+        except (ValueError, KeyError) as e:
+            msg = str(e)
+            if "model type" not in msg and "qwen3_5" not in msg:
+                raise
+
+        # Slow path: direct safetensors load. Only triggered when AutoConfig
+        # raised a "model type X not recognized" — for any other failure
+        # we re-raised above.
+        snapshot_dir = _resolve_local_snapshot(model_name_or_path)
+        if snapshot_dir is None:
+            raise RuntimeError(
+                f"AutoConfig rejected {model_name_or_path!r} and no local "
+                f"HF cache snapshot was found. Either upgrade transformers "
+                f"(`pip install git+https://github.com/huggingface/transformers.git`) "
+                f"or pre-download the model into ~/.cache/huggingface/hub/."
+            )
+        cfg_ns, state_dict = _load_via_safetensors_direct(snapshot_dir, dtype=load_dtype)
+        self.config = detect_model_config(cfg_ns)
+        self.model = _StaticStateDictModel(state_dict)
         self.model.eval()
 
     def extract(self) -> Dict[str, QuantizedWeights]:
@@ -255,8 +408,9 @@ class ModelExtractor:
         weights = {}
         sd = self.model.state_dict()
         c = self.config
-        gdn_dim = c.gdn_num_heads * c.gdn_d_head  # 2048
-        attn_q_dim = c.num_q_heads * c.d_head       # 2048
+        gdn_k_dim = c.gdn_num_heads * c.gdn_d_head      # K (and Q) dim for GDN
+        gdn_v_dim = c.gdn_v_num_heads * c.gdn_v_d_head  # V dim for GDN (may differ from K)
+        attn_q_dim = c.num_q_heads * c.d_head
 
         for layer_idx in range(c.n_layers):
             prefix = f"model.layers.{layer_idx}"
@@ -279,11 +433,19 @@ class ModelExtractor:
             if layer_type == 'gdn':
                 # --- GatedDeltaNet layer ---
                 try:
-                    # Fused QKV → split into separate Q, K, V
+                    # Fused QKV → split into separate Q, K, V (Q and K share gdn_k_dim, V uses gdn_v_dim)
                     qkv_w = sd[f"{prefix}.linear_attn.in_proj_qkv.weight"].float().numpy()
-                    q_w = qkv_w[:gdn_dim, :]
-                    k_w = qkv_w[gdn_dim:2*gdn_dim, :]
-                    v_w = qkv_w[2*gdn_dim:, :]
+                    expected_rows = 2 * gdn_k_dim + gdn_v_dim
+                    if qkv_w.shape[0] != expected_rows:
+                        raise ValueError(
+                            f"Layer {layer_idx} fused QKV rows {qkv_w.shape[0]} != "
+                            f"2*gdn_k_dim + gdn_v_dim ({2*gdn_k_dim}+{gdn_v_dim}={expected_rows}). "
+                            f"Config mismatch: linear_num_key_heads={c.gdn_num_heads}, "
+                            f"linear_num_value_heads={c.gdn_v_num_heads}"
+                        )
+                    q_w = qkv_w[:gdn_k_dim, :]
+                    k_w = qkv_w[gdn_k_dim:2*gdn_k_dim, :]
+                    v_w = qkv_w[2*gdn_k_dim:2*gdn_k_dim + gdn_v_dim, :]
 
                     # Output gate (in_proj_z) → stored as g_proj
                     z_w = sd[f"{prefix}.linear_attn.in_proj_z.weight"].float().numpy()
@@ -467,10 +629,35 @@ class ModelExtractor:
         return weights
 
     def get_hidden_states(self, text: str, layer_idx: int = 0):
-        """Get hidden states at a specific layer for a given input text."""
-        import torch
-        from transformers import AutoTokenizer
+        """Get hidden states at a specific layer for a given input text.
 
+        Falls back to a synthetic input vector when the loaded model is the
+        `_StaticStateDictModel` stand-in (i.e. when AutoModel was bypassed
+        via `_load_via_safetensors_direct`). Synthetic input has the same
+        shape as a real hidden state and uses values small enough to pass
+        the prover's RMSNorm QR-perturbation loop without much rejection.
+        For benchmarking, prove cost depends only on dimensions, so the
+        synthetic input gives identical timing — only correctness against
+        a specific token stream is lost. Reported in benchmark output."""
+        import torch
+
+        if isinstance(self.model, _StaticStateDictModel):
+            # Direct-safetensors path: no callable model.
+            import numpy as np
+            import sys
+            print(
+                "      [info] AutoModel bypass active — using synthetic "
+                "hidden-state input (benchmark prove cost is unaffected; "
+                "semantic correctness against the token stream is not).",
+                file=sys.stderr,
+            )
+            d_model = self.config.d_model
+            rng = np.random.default_rng(seed=42)
+            # Small symmetric-around-zero values so that RMSNorm sum_sq ≠ 0
+            # and the QR-perturbation loop converges fast.
+            return rng.standard_normal(d_model).astype(np.float32) * 0.1
+
+        from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         inputs = tokenizer(text, return_tensors="pt")
 

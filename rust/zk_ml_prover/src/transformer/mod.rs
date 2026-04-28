@@ -195,6 +195,24 @@ pub struct ModelConfig {
     pub vocab_size: usize,
     pub norm_type: NormType,
     pub activation: ActivationType,
+    /// V head count — may differ from num_kv_heads in GDN layers (Qwen3.5-4B/9B).
+    /// 0 means "fall back to num_kv_heads" for backward compatibility.
+    #[serde(default)]
+    pub v_num_heads: usize,
+    /// V head dim — may differ from d_head in GDN layers.
+    /// 0 means "fall back to d_head".
+    #[serde(default)]
+    pub v_d_head: usize,
+}
+
+impl ModelConfig {
+    /// Effective V dim, with fallback to symmetric K=V case for back-compat.
+    #[inline]
+    pub fn v_dim(&self) -> usize {
+        let vh = if self.v_num_heads == 0 { self.num_kv_heads } else { self.v_num_heads };
+        let vd = if self.v_d_head == 0 { self.d_head } else { self.v_d_head };
+        vh * vd
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -210,9 +228,21 @@ pub enum ActivationType {
 }
 
 /// Simple RMSNorm forward: y = gamma * x / rms(x)
+///
 /// Uses QR perturbation on x[0] when d/sum_sq is not a quadratic residue in M31.
-/// Returns (output, perturbed_input) — the input may differ from x at index 0.
-pub fn rmsnorm_forward(x: &[F], gamma: &[F]) -> (Vec<F>, Vec<F>) {
+///
+/// Returns `(output, perturbed_input, delta)` — `delta` is the signed
+/// perturbation applied to `x[0]` (0 if no perturbation was needed).
+///
+/// /// SOUNDNESS (S5): the delta is exposed so callers can store it in their
+/// trace and pass it to `prove_rmsnorm`/`prove_rmsnorm_ef`, which absorb it
+/// onto the main transcript. The verifier reads delta from the proof and
+/// absorbs the same value, binding the perturbation choice into Fiat-Shamir.
+/// Without this, the perturbation amount was a hidden side-channel: prover
+/// and verifier agreed only because both executed the same deterministic
+/// loop. Any change to iteration order would silently break compatibility
+/// without the proof failing in a recognizable way.
+pub fn rmsnorm_forward(x: &[F], gamma: &[F]) -> (Vec<F>, Vec<F>, i32) {
     let d = x.len();
     let d_field = F::from_canonical_u32(d as u32);
 
@@ -223,7 +253,7 @@ pub fn rmsnorm_forward(x: &[F], gamma: &[F]) -> (Vec<F>, Vec<F>) {
         if is_qr_m31(target) {
             let r = mod_sqrt_m31(target);
             let out = x.iter().zip(gamma.iter()).map(|(&xi, &gi)| gi * xi * r).collect();
-            return (out, x.to_vec());
+            return (out, x.to_vec(), 0);
         }
     }
 
@@ -250,7 +280,7 @@ pub fn rmsnorm_forward(x: &[F], gamma: &[F]) -> (Vec<F>, Vec<F>) {
                 let mut x_p = x.to_vec();
                 x_p[0] = new_x0;
                 let out = x_p.iter().zip(gamma.iter()).map(|(&xi, &gi)| gi * xi * r).collect();
-                return (out, x_p);
+                return (out, x_p, perturbation);
             }
         }
     }

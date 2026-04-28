@@ -41,6 +41,44 @@ pub struct RowProof {
     pub output: Vec<u32>,
 }
 
+/// Sub-proof binding `attn_out` to `v` at `seq_len=1` (P10-3 closure).
+///
+/// SOUNDNESS (S4, P10-3): at `seq_len=1` the row
+/// attention sumcheck is trivial (`row_proofs: vec![]`) but the
+/// downstream chain consumes a prover-declared `attn_out`. The audit-mode
+/// architecture binds `attn_out = f(v)` indirectly through the verifier's
+/// `qwen_forward` recomputation. Once we move toward true ZK with hidden
+/// weights, that binding evaporates. This sub-proof closes the gap
+/// pre-emptively: at `seq_len=1` the prover derives a fresh point `r`
+/// from the transcript over `log2(attn_out_dim)` coordinates, then
+/// commits two MLE evaluations:
+///   - `attn_out_at_r = MLE(attn_out, r)`
+///   - `v_at_r = MLE(v, r)` (or, for GQA full-attn where `attn_out` is a
+///     head-replication of `v`, the equivalent point in v's coordinate
+///     space — verifier computes the permutation independently)
+///
+/// In the honest case both evaluations equal each other (GDN identity)
+/// or the deterministic permutation (GQA). The verifier asserts the
+/// expected relationship; by Schwartz-Zippel a tampered `attn_out`
+/// passes only with probability `log(attn_out_dim) / |F|` — at base
+/// field that's ~2^-21, at EF (124-bit) that's negligible.
+///
+/// Non-breaking: `#[serde(default)]` makes legacy proofs (without the
+/// field) deserialize as `None`; verifier accepts `None` only in
+/// audit-mode-only configurations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Seq1VConsistency {
+    /// Multilinear extension of `attn_out` evaluated at the fresh
+    /// transcript-derived point `r`.
+    pub attn_out_at_r: u32,
+    /// Multilinear extension of `v` at `r` (GDN) or at `perm(r)` (GQA).
+    pub v_at_r: u32,
+    /// True iff the prover's path is the GQA full-attn head-replication
+    /// branch (verifier reconstructs the permutation differently per
+    /// branch). For GDN-style q_heads == kv_heads this is `false`.
+    pub is_gqa_full_attn: bool,
+}
+
 /// Full row-decomposed multi-head attention proof.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RowAttentionProof {
@@ -49,6 +87,11 @@ pub struct RowAttentionProof {
     pub num_heads: usize,
     pub seq_len: usize,
     pub d_head: usize,
+    /// P10-3: `seq_len=1` v↔attn_out consistency sub-proof.
+    /// `None` for `seq_len >= 2` (the row sumcheck binds the relationship
+    /// directly) and for legacy proofs predating P10-3.
+    #[serde(default)]
+    pub seq1_consistency: Option<Seq1VConsistency>,
 }
 
 /// Compute softmax from field elements using the exp lookup table.
@@ -220,6 +263,9 @@ pub fn prove_row_attention(
         num_heads,
         seq_len,
         d_head,
+        // seq_len >= 2: row sumcheck binds attn_out to v directly; no
+        // separate seq1_consistency needed.
+        seq1_consistency: None,
     }
 }
 
@@ -451,6 +497,7 @@ pub fn prove_row_attention_gqa(
         num_heads: num_q_heads,
         seq_len,
         d_head,
+        seq1_consistency: None,
     }
 }
 
@@ -576,6 +623,7 @@ mod tests {
                 root: [0u8; 32],
                 num_weights: 256,
                 log_height: 8,
+                kind: crate::proving::weight_commitment::WeightDigestKind::Blake3Fast,
             },
         }
     }

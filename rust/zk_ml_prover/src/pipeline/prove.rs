@@ -11,7 +11,7 @@ use crate::proving::sumcheck::{self, Transcript};
 use crate::proving::matmul::prove_matmul_succinct;
 use crate::proving::gelu::prove_gelu;
 use crate::proving::layernorm::prove_layernorm_sqr;
-use crate::proving::weight_commitment::{commit_weights_fast, prove_mle_eval_no_merkle};
+use crate::proving::weight_commitment::{commit_weights_fast, prove_mle_eval_no_merkle, prove_mle_eval_bound};
 use crate::proving::attention::prove_row_attention;
 use crate::protocol::*;
 use crate::transformer::{
@@ -67,7 +67,12 @@ pub(super) fn prove_all_ops(
         });
     }
 
-    if all_qwen && num_layers > 1 {
+    // SOUNDNESS (M1, Option C): default routes to extension-field (124-bit) prover.
+    // `--fast` (set via `is_fast_mode()`) opts into the sequential base-field path
+    // which gives ~31-bit challenges — explicitly off-by-default.
+    let use_ef_qwen = all_qwen && num_layers > 1 && !crate::proving::sumcheck::is_fast_mode();
+
+    if use_ef_qwen {
         // ===== PARALLEL PROVE: independent per-layer transcripts =====
         use rayon::prelude::*;
         // Build lookup tables once (all layers share the same scales)
@@ -86,14 +91,69 @@ pub(super) fn prove_all_ops(
             .expect("all_qwen=true but qwen_commitments is None — forward pass bug");
 
         // Prove all layers in parallel with extension-field challenges (124-bit soundness).
-        // In pcs-full mode, limit parallelism to avoid memory pressure from batch
-        // Basefold encoding (8 polynomials × ~64MB per layer = ~500MB per concurrent layer).
-        // pcs-full: limit parallelism (8 large encodings per layer = ~500MB each)
-        // pcs/default: full parallelism (w_partial encodings are tiny)
+        //
+        // SAFETY (P10-6, memory-aware scheduler): the
+        // previous heuristic was `par_chunk_size = num_layers` for default
+        // mode (full fan-out) and `8` for `pcs-full`. On Qwen3.5-9B
+        // (d_model=4096, d_ff=12288) every layer holds ~200 MB of weights;
+        // 32 layers × 200 MB × ~4× proof-intermediate factor = ~25 GB peak,
+        // which exceeds free RAM on a 32 GB box and degrades to swap-bound
+        // serial — the README "scale ceiling" note. The new scheduler
+        // computes a per-layer footprint from the actual weight tensor
+        // sizes and caps `par_chunk_size` so the projected peak working
+        // set stays inside `TARGET_PEAK_BYTES`. 4B layers are ~50 MB each
+        // → cap is well above num_layers, no regression on the 4B
+        // benchmark; 9B layers blow the cap → cap drops to ~6-8, fitting
+        // the working set.
+        // Default target: 32 GB peak working set. Override via env
+        // `ZKMLP_TARGET_PEAK_GB` for hosts with more or less RAM. Apple
+        // M4 Max ships with 36/48/64/128 GB; 32 GB is the conservative
+        // floor that fits all of them with margin.
+        let target_peak_bytes: usize = std::env::var("ZKMLP_TARGET_PEAK_GB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|gb| gb * 1024 * 1024 * 1024)
+            .unwrap_or(32 * 1024 * 1024 * 1024);
+        const PER_LAYER_OVERHEAD_FACTOR: usize = 4; // proof scratch + transcript bufs ≈ 3-4× weight bytes
+
+        let per_layer_bytes: usize = qwen_layer_data
+            .values()
+            .next()
+            .map(|(weights, _, _, _, _)| {
+                weights.norm1_gamma.len() * 4
+                    + weights.w_q.len() * 4
+                    + weights.w_k.len() * 4
+                    + weights.w_v.len() * 4
+                    + weights.w_o.len() * 4
+                    + weights.w_g_proj.len() * 4
+                    + weights.norm2_gamma.len() * 4
+                    + weights.w_gate.len() * 4
+                    + weights.w_up.len() * 4
+                    + weights.w_down.len() * 4
+            })
+            .unwrap_or(0);
+
+        let memory_cap = if per_layer_bytes > 0 {
+            (target_peak_bytes / (per_layer_bytes * PER_LAYER_OVERHEAD_FACTOR)).max(1)
+        } else {
+            num_layers
+        };
+
+        // Don't exceed rayon's thread pool — extra concurrency above the
+        // physical thread count just queues. Don't exceed `num_layers`
+        // because that's the available work. `pcs-full` keeps a hard cap
+        // at 8 because Basefold's batch encoding has its own per-layer
+        // ~500 MB footprint that's NOT in the weight bytes above.
+        let rayon_threads = rayon::current_num_threads();
         #[cfg(feature = "pcs-full")]
-        let par_chunk_size = 8.max(1);
+        let par_chunk_size = 8.min(memory_cap).min(rayon_threads).min(num_layers).max(1);
         #[cfg(not(feature = "pcs-full"))]
-        let par_chunk_size = num_layers;
+        let par_chunk_size = memory_cap.min(rayon_threads).min(num_layers).max(1);
+
+        eprintln!(
+            "  P10-6 scheduler: per_layer_bytes={} MB, memory_cap={}, rayon_threads={}, num_layers={} → par_chunk_size={}",
+            per_layer_bytes / (1024 * 1024), memory_cap, rayon_threads, num_layers, par_chunk_size,
+        );
 
         let parallel_results: Vec<(usize, QwenLayerProofEF, String)> = {
             let indices: Vec<usize> = (0..num_layers).collect();
@@ -209,10 +269,10 @@ pub(super) fn prove_all_ops(
                             .iter()
                             .map(|&v| F::from_canonical_u32(v))
                             .collect();
-                        let mut chain_transcript = Transcript::new(b"relu-chain");
-                        chain_transcript.absorb_bytes(&a_commitment.root);
-                        let (claimed, proof) =
-                            prove_mle_eval_no_merkle(&a_pad, &chain_point, &mut chain_transcript);
+                        // S2: bind to main transcript.
+                        let (claimed, proof) = prove_mle_eval_bound(
+                            &a_pad, &chain_point, b"relu-chain", &a_commitment, &mut transcript,
+                        );
                         (Some(proof), Some(claimed.as_canonical_u32()))
                     } else {
                         (None, None)
@@ -225,9 +285,10 @@ pub(super) fn prove_all_ops(
                 let r_point = transcript.squeeze_many(log_n);
 
                 let a_at_r = mle_evaluate(&a_pad, &r_point);
-                let mut eval_transcript = Transcript::new(b"relu-eval");
-                eval_transcript.absorb_bytes(&a_commitment.root);
-                let (_, a_eval_proof) = prove_mle_eval_no_merkle(&a_pad, &r_point, &mut eval_transcript);
+                // S2: bind inner MLE-eval to main transcript.
+                let (_, a_eval_proof) = prove_mle_eval_bound(
+                    &a_pad, &r_point, b"relu-eval", &a_commitment, &mut transcript,
+                );
 
                 let eq_r = eq_evals(&r_point);
 
@@ -443,7 +504,13 @@ pub(super) fn prove_all_ops(
                 let y = layer.ln_y.as_ref()
                     .expect("rmsnorm layer missing ln_y — forward pass did not populate it");
 
-                let proof = crate::proving::rmsnorm::prove_rmsnorm(x, gamma, y, &mut transcript);
+                // Standalone-rmsnorm pipeline path: x is the (possibly already
+                // perturbed) input — the upper-layer caller is responsible for
+                // tracking the delta. Pass 0 here; verifier mirrors. Used by
+                // pipeline tests only; production transformer paths flow
+                // through qwen/llama traces with explicit norm{1,2}_delta.
+                let perturbation_delta = 0i32;
+                let proof = crate::proving::rmsnorm::prove_rmsnorm(x, gamma, y, perturbation_delta, &mut transcript);
                 let proof_bytes = serde_json::to_vec(&proof).unwrap_or_default();
                 proof_size += proof_bytes.len();
 

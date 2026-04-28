@@ -1,12 +1,24 @@
 # ZK-ML Proof Server — Python dependencies
 #
-# Derived from actual imports in serve.py and python/tvm_to_gkr/*.py
-# CPU-only torch to keep the image small (no CUDA runtime).
+# Derived from actual imports in serve.py, python/tvm_to_gkr/*.py, and
+# python/benchmark_mnist.py. CPU-only torch to keep the image small (no
+# CUDA runtime).
+#
+# REPRODUCIBILITY (R5, R6 — funding-readiness):
+#   - `transformers` lower bound bumped from 4.30 to 4.49: ModelExtractor
+#     uses the `dtype=` kwarg of `AutoModelForCausalLM.from_pretrained`,
+#     which only exists from 4.49 onward (older versions silently swallow
+#     it under `**kwargs` and load fp16 by default → quantization drift).
+#   - `torchvision` was missing entirely; benchmark_mnist.py imports it
+#     for `datasets.MNIST` and the standard `transforms.ToTensor()`. A
+#     fresh install would crash with ImportError on the very first
+#     benchmark run.
 
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.0.0
+torchvision>=0.15.0
 numpy>=1.24.0
-transformers>=4.30.0
+transformers>=4.49.0
 fastapi>=0.100.0
 uvicorn[standard]>=0.20.0
 pydantic>=2.0.0

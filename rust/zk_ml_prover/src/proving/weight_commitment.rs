@@ -18,12 +18,46 @@ use crate::proving::sumcheck::{self, EF, EFElement, SumcheckProof, SumcheckProof
 
 type F = Mersenne31;
 
-/// 32-byte Merkle root commitment to a weight vector.
+/// Discriminant for which hash family produced the `root` field of a
+/// `WeightCommitment` (E8).
+///
+/// SOUNDNESS (E8): the prover historically produced two flavors of root
+/// — a 32-byte blake3 fast hash and a 16-byte Merkle digest zero-padded
+/// to 32 bytes — and the verifier had no way to tell them apart from the
+/// proof itself. Two distinct commitments could collide on the byte pattern
+/// (e.g. a Blake3 fast-hash that happened to start with 16 bytes that also
+/// formed a valid Merkle root). With the explicit discriminant the verifier
+/// asserts the expected family and refuses any cross-kind substitution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WeightDigestKind {
+    /// 32-byte blake3 hash of `b"weights" || little-endian field bytes`.
+    /// Produced by `commit_weights_fast`. The full 32 bytes of `root` are
+    /// significant.
+    Blake3Fast,
+    /// 16-byte AES-MMO Merkle root, zero-padded into the high 16 bytes of
+    /// `root`. Produced by `commit_weights`. Only the first
+    /// `pcs::DIGEST_BYTES` of `root` are significant; the trailing bytes
+    /// are zero by construction.
+    MerkleAesMmo,
+}
+
+impl Default for WeightDigestKind {
+    fn default() -> Self { WeightDigestKind::Blake3Fast }
+}
+
+/// 32-byte (or 16-byte zero-padded) digest commitment to a weight vector.
+///
+/// SOUNDNESS (E8): see `WeightDigestKind`. The `kind` field is `serde(default)`
+/// so existing serialized proofs deserialize as `Blake3Fast` (the historical
+/// behavior); new proofs always carry an explicit kind. Verifier paths should
+/// `debug_assert_eq!(commitment.kind, ExpectedKind)` to catch mis-routing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WeightCommitment {
     pub root: [u8; 32],
     pub num_weights: usize,
     pub log_height: usize,
+    #[serde(default)]
+    pub kind: WeightDigestKind,
 }
 
 /// Proof that W̃(point) = claimed_value, verifiable against a Merkle root.
@@ -68,6 +102,7 @@ pub fn commit_weights_fast(weights: &[F]) -> WeightCommitment {
         root: *hasher.finalize().as_bytes(),
         num_weights: n,
         log_height: log_n,
+        kind: WeightDigestKind::Blake3Fast,
     }
 }
 
@@ -90,6 +125,7 @@ pub fn commit_weights(weights: &[F]) -> (WeightCommitment, MerkleTree) {
         root,
         num_weights: n,
         log_height: log_n,
+        kind: WeightDigestKind::MerkleAesMmo,
     };
     (commitment, tree)
 }
@@ -377,6 +413,56 @@ pub fn verify_mle_eval_ef(
     true
 }
 
+// =============================================================================
+// SOUNDNESS: bound MLE-eval helpers (Phase 1 / S2 fix)
+// =============================================================================
+//
+// Problem (pre-fix): callers like rmsnorm / layernorm / elementwise created a
+// fresh `Transcript::new(b"label")` per inner MLE-eval, then absorbed only the
+// commitment root before calling prove/verify_mle_eval_no_merkle. The inner
+// challenges thus depended ONLY on the static label + commitment root, not on
+// the protocol state accumulated by the main transcript. This made the inner
+// FS challenges grindable (~32 bytes of effective entropy) and broke
+// composition of soundness across sub-proofs.
+//
+// Fix: thread the MAIN transcript through inner evals, prefixed with a
+// per-call domain separator + commitment-root absorption. This binds inner
+// challenges to ALL prior protocol state. Prover and verifier perform identical
+// absorptions in identical order, keeping transcripts synchronised.
+
+/// SOUNDNESS: prove an inner base-field MLE-eval bound to the main transcript.
+/// Absorbs `domain_label` (per-call separator) and the commitment root before
+/// running the underlying product-sumcheck on `transcript`. Replaces the
+/// deprecated fresh-`Transcript::new` pattern.
+pub fn prove_mle_eval_bound(
+    weights: &[F],
+    point: &[F],
+    domain_label: &[u8],
+    commitment: &WeightCommitment,
+    transcript: &mut Transcript,
+) -> (F, MleEvalProof) {
+    transcript.absorb_bytes(domain_label);
+    transcript.absorb_bytes(&commitment.root);
+    prove_mle_eval_no_merkle(weights, point, transcript)
+}
+
+/// SOUNDNESS: verifier counterpart of `prove_mle_eval_bound`. Absorbs the same
+/// domain separator + commitment root onto the main transcript before
+/// delegating to `verify_mle_eval`. Must be called in the same order the prover
+/// invoked `prove_mle_eval_bound` for transcripts to stay in sync.
+pub fn verify_mle_eval_bound(
+    commitment: &WeightCommitment,
+    claimed_value: F,
+    point: &[F],
+    proof: &MleEvalProof,
+    domain_label: &[u8],
+    transcript: &mut Transcript,
+) -> bool {
+    transcript.absorb_bytes(domain_label);
+    transcript.absorb_bytes(&commitment.root);
+    verify_mle_eval(commitment, claimed_value, point, proof, transcript)
+}
+
 /// Prove W̃(point) = value where W is base-field `&[F]` and point is `&[EF]`.
 /// No Merkle openings. Used for MLE eval proofs in EF-challenge modules
 /// (rmsnorm, layernorm, elementwise) where weights are base field but
@@ -416,9 +502,126 @@ pub fn prove_mle_eval_no_merkle_ef_base(
     )
 }
 
+/// SOUNDNESS: prove an inner EF MLE-eval bound to the main transcript (S2 fix
+/// for EF-challenge paths). See `prove_mle_eval_bound` for full rationale.
+pub fn prove_mle_eval_ef_base_bound(
+    weights: &[F],
+    point: &[EF],
+    domain_label: &[u8],
+    commitment: &WeightCommitment,
+    transcript: &mut Transcript,
+) -> (EF, MleEvalProofEF) {
+    transcript.absorb_bytes(domain_label);
+    transcript.absorb_bytes(&commitment.root);
+    prove_mle_eval_no_merkle_ef_base(weights, point, transcript)
+}
+
+/// SOUNDNESS: verifier counterpart of `prove_mle_eval_ef_base_bound`. Must be
+/// invoked in the same order with the same labels for transcripts to sync.
+pub fn verify_mle_eval_ef_bound(
+    commitment: &WeightCommitment,
+    claimed_value: EF,
+    point: &[EF],
+    proof: &MleEvalProofEF,
+    domain_label: &[u8],
+    transcript: &mut Transcript,
+) -> bool {
+    transcript.absorb_bytes(domain_label);
+    transcript.absorb_bytes(&commitment.root);
+    verify_mle_eval_ef(commitment, claimed_value, point, proof, transcript)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SOUNDNESS regression (E8): `commit_weights_fast` produces a Blake3Fast
+    /// kind, `commit_weights` produces a MerkleAesMmo kind. They must NOT
+    /// be interchangeable.
+    #[test]
+    fn test_weight_commitment_kind_distinguishes_paths() {
+        let w: Vec<F> = (0..8).map(|i| F::from_canonical_u32(i + 1)).collect();
+        let fast = commit_weights_fast(&w);
+        assert_eq!(fast.kind, WeightDigestKind::Blake3Fast,
+            "commit_weights_fast must tag Blake3Fast");
+        let (merkle, _tree) = commit_weights(&w);
+        assert_eq!(merkle.kind, WeightDigestKind::MerkleAesMmo,
+            "commit_weights must tag MerkleAesMmo");
+        assert_ne!(fast.kind, merkle.kind, "kinds must be distinct");
+    }
+
+    /// Backwards-compat: serialized proofs that predate the discriminant
+    /// (no `kind` field in JSON) deserialize as the historical default
+    /// (Blake3Fast). This protects existing proof artifacts.
+    #[test]
+    fn test_weight_commitment_serde_default_is_blake3() {
+        let json = r#"{"root":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"num_weights":4,"log_height":2}"#;
+        let c: WeightCommitment = serde_json::from_str(json)
+            .expect("deserialize legacy commitment without kind");
+        assert_eq!(c.kind, WeightDigestKind::Blake3Fast,
+            "legacy proofs must default to Blake3Fast");
+    }
+
+    /// Round-trip: commit_weights_fast → serialize → deserialize preserves kind.
+    #[test]
+    fn test_weight_commitment_kind_roundtrips() {
+        let w: Vec<F> = (0..8).map(|i| F::from_canonical_u32(i + 1)).collect();
+        let c = commit_weights_fast(&w);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: WeightCommitment = serde_json::from_str(&json).unwrap();
+        assert_eq!(c.kind, back.kind);
+        assert_eq!(c.root, back.root);
+    }
+
+    /// SOUNDNESS regression: prove_mle_eval_bound must thread main transcript
+    /// state through to inner sumcheck challenges. Two transcripts that differ
+    /// ONLY in prior protocol state (same data, point, commitment, label) must
+    /// produce different proof bytes — proving the inner challenges depend on
+    /// the main transcript. (Pre-fix: fresh inner Transcript::new(b"label") +
+    /// commitment-root absorption gave identical challenges regardless of
+    /// prior protocol state.)
+    #[test]
+    fn test_mle_eval_bound_threads_main_transcript() {
+        let w: Vec<F> = (0..8).map(|i| F::from_canonical_u32(i + 1)).collect();
+        let (commitment, _) = commit_weights(&w);
+        let point = vec![F::from_canonical_u32(5), F::from_canonical_u32(7), F::from_canonical_u32(11)];
+
+        // Two prover runs with different prior protocol state.
+        let mut t1 = Transcript::new(b"protocol");
+        t1.absorb(0xDEAD_BEEF);
+        let (claim1, proof1) = prove_mle_eval_bound(
+            &w, &point, b"test-label", &commitment, &mut t1,
+        );
+
+        let mut t2 = Transcript::new(b"protocol");
+        t2.absorb(0xCAFE_BABE);
+        let (claim2, proof2) = prove_mle_eval_bound(
+            &w, &point, b"test-label", &commitment, &mut t2,
+        );
+
+        // Same weights and point → same evaluated claim (correctness).
+        assert_eq!(claim1, claim2, "claim must equal mle_evaluate(w, point)");
+
+        // Different prior state → different inner challenges → different proof.
+        // (Round-poly bytes will diverge at round 1 of the sumcheck.)
+        assert_ne!(
+            proof1.eval_sumcheck.round_polys, proof2.eval_sumcheck.round_polys,
+            "inner challenges did not depend on prior transcript state — Fiat-Shamir composition broken"
+        );
+
+        // verify_mle_eval_bound must accept correctly-paired proof and reject wrong one.
+        let mut tv1 = Transcript::new(b"protocol");
+        tv1.absorb(0xDEAD_BEEF);
+        assert!(verify_mle_eval_bound(
+            &commitment, claim1, &point, &proof1, b"test-label", &mut tv1
+        ));
+
+        let mut tv1_wrong = Transcript::new(b"protocol");
+        tv1_wrong.absorb(0xDEAD_BEEF);
+        assert!(!verify_mle_eval_bound(
+            &commitment, claim1, &point, &proof2, b"test-label", &mut tv1_wrong
+        ), "verifier accepted proof from a different transcript context");
+    }
 
     #[test]
     fn test_commit_weights() {

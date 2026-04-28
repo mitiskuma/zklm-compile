@@ -1,0 +1,230 @@
+# R4: minimal CI for the Rust prover.
+#
+# Goals:
+#  - Verify `cargo build --release` and `cargo test --release` pass on
+#    ubuntu-latest (the most-likely investor reproduction target) and
+#    macos-latest (matches our M4 Max benchmarks via Apple Silicon CI).
+#  - Lock the toolchain to the same channel `rust-toolchain.toml` pins
+#    (1.85.0). Disable rustup auto-upgrade so the build is deterministic.
+#  - Skip the `metal_gpu` feature on CI: GitHub Actions macOS runners are
+#    Intel x86_64 (no Metal device available to the runner process), and
+#    enabling the feature would cause a build-script panic at link time.
+#    Local M-series testing covers the metal_gpu path.
+#  - Skip pcs-full on Linux: the FRI build slows tests by ~6x and adds no
+#    coverage that the default-feature run doesn't already exercise.
+#
+# Triggers: every push to any branch + every PR. The 
+# branch must stay green.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  # Phase 11 P11-6: nightly soak job + manual dispatch handle.
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# P11-6: cancel duplicate runs of the same ref so rapid pushes don't pile
+# up CI minutes. Soak runs (workflow_dispatch / schedule) get their own
+# group via run_id so we never cancel a partially-completed nightly.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && github.run_id || 'pr' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # SAFETY: do NOT inherit the developer's local `target-cpu=native` —
+  # CI runners are different silicon. R3 work removed it from the cargo
+  # config, and we restate the portable default here for paranoia.
+  RUSTFLAGS: ""
+  # P11-6: cap proptest cases at 100 for PR runs. Per-test `proptest_config`
+  # already sets `cases: 30`, but `PROPTEST_CASES` is read at runtime and
+  # acts as the upper bound — 100 is the cap for fast PRs.
+  # The `phase11-soak` job overrides this to 10000 for deep statistical
+  # regression hunting.
+  PROPTEST_CASES: "100"
+
+jobs:
+  build-and-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        # The toolchain file at `rust/zk_ml_prover/rust-toolchain.toml`
+        # forces channel 1.85.0; rustup picks it up automatically when
+        # cargo runs in that directory. We pre-warm it here so the cache
+        # is populated before the first cargo invocation.
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+        working-directory: rust/zk_ml_prover
+
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/zk_ml_prover/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/zk_ml_prover/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # P11-6: the Phase 11 proptest harness shells out to
+      # `python3 tests/reference/run.py` per case (subprocess JSON
+      # exchange). Without numpy available, the harness aborts on the
+      # first proptest case and `cargo test --release` fails. Setup
+      # runs BEFORE cargo test so the integration tests pick it up.
+      - name: Setup Python (Phase 11 reference harness)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install numpy + blake3 + smoke-check reference shim
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy blake3
+          python3 -c "import numpy, blake3; print('numpy', numpy.__version__, 'blake3 ok')"
+
+      - name: cargo build --release (default features)
+        working-directory: rust/zk_ml_prover
+        run: cargo build --release --locked
+
+      - name: cargo test --release (default features)
+        working-directory: rust/zk_ml_prover
+        run: cargo test --release --locked
+
+      - name: cargo test --release --features pcs (smoke only)
+        working-directory: rust/zk_ml_prover
+        run: cargo test --release --locked --features pcs -- --skip slow
+
+      # Reviewer-flagged gap: zk_compile_prover and its example/quickstart
+      # were not exercised by CI before. The Groth16 quickstart is the very
+      # first thing the README sells, so a green CI badge that doesn't
+      # cover it silently rots. Build + test + smoke-test the example
+      # circuit so any binary-protocol drift surfaces immediately.
+      - name: cargo build --release (zk_compile_prover)
+        working-directory: rust/zk_compile_prover
+        run: cargo build --release --locked
+
+      - name: cargo test --release (zk_compile_prover)
+        working-directory: rust/zk_compile_prover
+        run: cargo test --release --locked
+
+      - name: examples/quickstart.sh smoke-test
+        run: ./examples/quickstart.sh
+
+  format-and-lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain components
+        run: |
+          rustup component add rustfmt clippy
+          rustc --version
+        working-directory: rust/zk_ml_prover
+
+      - name: rustfmt --check
+        # Don't fail the whole build on existing formatting drift —
+        # this is informational while the branch
+        # stabilizes. Flip to `--check` strict once the tree is clean.
+        working-directory: rust/zk_ml_prover
+        run: cargo fmt -- --check || echo "::warning::rustfmt drift detected (non-blocking)"
+
+      - name: clippy (warnings only, non-blocking)
+        working-directory: rust/zk_ml_prover
+        run: cargo clippy --release --locked -- -W clippy::all || echo "::warning::clippy lints (non-blocking)"
+
+  # P11-6: nightly soak job. Cranks PROPTEST_CASES to 10,000 across the
+  # four phase11_* integration tests to catch deep statistical regressions
+  # that the PR-tier 100-case run can miss. One platform (ubuntu-latest)
+  # is sufficient — soak hunts MLE / quantization soundness drift, not
+  # platform-specific bugs (those belong in the matrix above).
+  # Triggers on `schedule` (06:00 UTC) and `workflow_dispatch` only so
+  # PRs aren't slowed by the 4-hour ceiling.
+  phase11-soak:
+    name: phase11 nightly soak (10k cases)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      # Nightly soak: 10,000 cases for the nightly soak run.
+      PROPTEST_CASES: "10000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+        working-directory: rust/zk_ml_prover
+
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/zk_ml_prover/target
+          key: ${{ runner.os }}-cargo-soak-${{ hashFiles('rust/zk_ml_prover/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Same Python+numpy setup as build-and-test: the proptest harness
+      # subprocess-execs `tests/reference/run.py` per case.
+      - name: Setup Python (Phase 11 reference harness)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install numpy + blake3 + smoke-check reference shim
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy blake3
+          python3 -c "import numpy, blake3; print('numpy', numpy.__version__, 'blake3 ok')"
+
+      # Run only the four phase11_* integration test targets at 10k
+      # cases. Skipping unit tests / pcs smoke keeps the soak focused on
+      # statistical coverage of the property + tamper matrix surface.
+      - name: cargo test --release (phase11 soak, 10k cases)
+        working-directory: rust/zk_ml_prover
+        run: |
+          cargo test --release --locked \
+            --test phase11_proptest_harness \
+            --test phase11_mle_relations \
+            --test phase11_quantization_invariants \
+            --test phase11_tamper_matrix
+
+      # On any failure, upload `harness.proptest-regressions` so the
+      # failing seed can be replayed locally with `cargo test`. The file
+      # is checked into the repo but proptest appends discovered seeds
+      # to it during the run.
+      - name: Upload proptest regressions on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase11-proptest-regressions
+          path: rust/zk_ml_prover/tests/property/harness.proptest-regressions
+          if-no-files-found: ignore

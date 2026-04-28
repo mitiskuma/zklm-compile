@@ -1,5 +1,15 @@
+# R3: default to a PORTABLE build. Reviewers compiling
+# on different hardware (CI, x86 servers, other Apple Silicon revisions)
+# previously inherited a `target-cpu=native` flag baked into this file,
+# which produced binaries that crashed with `SIGILL` on dissimilar CPUs.
+#
+# To opt back into the M4-Max-specific micro-optimizations for personal
+# benchmarking, set the `RUSTFLAGS` env var explicitly:
+#
+#     RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+# We deliberately leave this file *empty of flags*. Anything the upstream
+# Plonky3 / metal crates need is determined per-target by their own build
+# scripts.
 [build]
-# NOTE: target-cpu=native produces binaries optimized for this specific CPU (M4 Max).
-# These binaries are NOT portable to other machines with different CPU features.
-# For portable/distributable builds, use: RUSTFLAGS="-C target-cpu=generic" cargo build --release
-rustflags = ["-C", "target-cpu=native"]
+# (intentionally no rustflags — see comment above)

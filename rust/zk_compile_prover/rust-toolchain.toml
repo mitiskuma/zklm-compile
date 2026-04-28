@@ -1,0 +1,8 @@
+# R2: pin the same toolchain as the sibling
+# `zk_ml_prover` crate so a fresh checkout builds reproducibly. arkworks
+# 0.5 has worked from 1.85.0 forward; pinning here protects against silent
+# upstream-required version bumps.
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

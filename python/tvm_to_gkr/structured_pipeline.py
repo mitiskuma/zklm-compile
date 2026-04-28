@@ -382,16 +382,22 @@ class RustProverServer:
             weight_entries.append(("lm_head", precompiled.lm_head_w_q, precompiled.lm_head_m, precompiled.lm_head_n))
             self._precompiled = precompiled
 
+        # Write the small magic + preamble parts first.
         parts.append(struct.pack('<I', len(weight_entries)))
+        preamble = b''.join(parts)
+        self.proc.stdin.write(preamble)
+
+        # Stream weights one at a time. Avoids holding all bytes in Python
+        # heap simultaneously (critical for 9B+ models on memory-constrained
+        # systems — concatenating 36GB+ before writing OOMs).
         for name, w_q, m, n in weight_entries:
             name_bytes = name.encode('utf-8')
-            parts.append(struct.pack('<I', len(name_bytes)))
-            parts.append(name_bytes)
-            parts.append(struct.pack('<II', m, n))
-            parts.append(np.asarray(w_q, dtype=np.uint32).tobytes())
-
-        preload_data = b''.join(parts)
-        self.proc.stdin.write(preload_data)
+            self.proc.stdin.write(struct.pack('<I', len(name_bytes)))
+            self.proc.stdin.write(name_bytes)
+            self.proc.stdin.write(struct.pack('<II', m, n))
+            arr = np.asarray(w_q, dtype=np.uint32)
+            self.proc.stdin.write(arr.tobytes())
+            del arr  # release temp copy if asarray made one
         self.proc.stdin.flush()
 
         elapsed = time.time() - t0
@@ -506,9 +512,15 @@ class RustProverServer:
                 parts.append(struct.pack('<I', len(name_bytes)))
                 parts.append(name_bytes)
                 cfg = op["config"]
-                parts.append(struct.pack('<IIIII',
+                # Header: d_model, d_ff, num_q_heads, num_kv_heads, d_head, v_num_heads, v_d_head
+                # v_num_heads/v_d_head added for asymmetric GDN (Qwen3.5-4B/9B). Defaults to
+                # num_kv_heads/d_head when missing for backward compat.
+                v_num_heads = cfg.get("v_num_heads", cfg["num_kv_heads"])
+                v_d_head = cfg.get("v_d_head", cfg["d_head"])
+                parts.append(struct.pack('<IIIIIII',
                     cfg["d_model"], cfg["d_ff"], cfg["num_q_heads"],
-                    cfg["num_kv_heads"], cfg["d_head"]))
+                    cfg["num_kv_heads"], cfg["d_head"],
+                    v_num_heads, v_d_head))
                 parts.append(struct.pack('<i', cfg["silu_scale"]))
                 parts.append(struct.pack('<i', cfg["sigmoid_scale"]))
                 # 10 weight name references

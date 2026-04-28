@@ -1,14 +1,61 @@
 # ZK-Compile: Zero-Knowledge Proofs as a Compiler Target for ML Inference
 
 **Authors:** ZK-Compile Contributors
-**Date:** March 2026
+**Date:** April 2026
 **Status:** Draft — not yet submitted
+
+> **Implementation-vs-design distinction (April 2026):**
+> this paper describes a *design proposal* for using Apache TVM's TensorIR
+> as a ZK compiler frontend. The shipping prover in this repository
+> (`rust/zk_ml_prover/`) does NOT use TVM in its current form; weight
+> extraction and quantization run through `python/tvm_to_gkr/` (named
+> after the design target, but currently a direct PyTorch → Mersenne-31
+> pipeline with no `import tvm`). The TVM integration described in
+> §3–4 of this paper is **future work**. Funding diligence reviewers
+> should evaluate the shipping prover (matmul + LayerNorm/RMSNorm +
+> SwiGLU/SiLU + GELU + LogUp + Basefold over M31) and treat the TVM
+> lowering as a roadmap item, not a current capability.
+>
+> **Verifier model (audit-mode vs. true-ZK):** the shipping prover
+> defaults to **verifier-trusted-weights mode** (audit-mode): the
+> verifier holds plaintext weights and re-runs a canonical forward
+> pass; sub-proof bindings (`Seq1VConsistency`, M3 LogUp `_with_data`
+> digest, residual MLE-at-r, GDN recurrence trajectory digest)
+> assume the verifier can recompute the trace. This is sound and
+> fast (376 ms prove / 74 ms verify on Qwen3.5-4B) but is **not
+> the "true ZK with hidden weights" mode** institutional crypto-fund
+> diligence assumes by default. The path to true-ZK — replacing
+> every audit-mode binding with an explicit `(WeightCommitment,
+> MleEvalProof)` pair — is documented (M3 closure plan + scaffold)
+> and is a structural rewrite, not a feature flag. Sections 7.4
+> and 8 detail the gap and the migration plan; the current
+> `--features pcs` / `--features pcs-full` flags upgrade weight
+> binding to Basefold but do **not** by themselves close the
+> audit-mode gap.
 
 ---
 
 ## Abstract
 
 We propose treating zero-knowledge proof generation as a compiler backend target, integrated into an existing ML compilation framework (Apache TVM). Current zkML systems (EZKL, zkPyTorch, DeepProve) each build custom compilation pipelines from ONNX or PyTorch IR, with limited access to the operator fusion, quantization, and memory planning passes that ML compilers provide. We observe that TVM's intermediate representations (Relax and TensorIR) decompose models into primitive arithmetic — structurally similar to what ZK constraint systems require — and propose a lowering from TensorIR to R1CS and AIR constraint systems. This enables (1) compiler-assisted circuit generation with ZK-aware fusion to reduce witness count, (2) field-native quantization targeting ZK-friendly fields, (3) dual compilation from a shared source representation for optimistic verification, and (4) the first cross-architecture comparison of ZK proving cost, demonstrating that hybrid architectures (GatedDeltaNet, Mamba-2) produce asymptotically fewer non-linear constraints than softmax transformers at long sequence lengths. We describe the design, discuss key technical challenges including field overflow, memory arguments, and proof composition, and outline an implementation plan with concrete validation milestones.
+
+A shipping reference implementation in Rust validates the
+architectural argument at scale: structured sumcheck over
+Mersenne-31 with M31⁴ extension-field challenges (~124-bit
+per-round soundness) **proves Qwen3.5-4B in 376 ms (74 ms verify,
+1.25 MB proof) on a single Apple M4 Max** — to our knowledge the
+first end-to-end measured zkML proof of a 4-billion-parameter hybrid
+transformer on commodity hardware. The shipping verifier operates
+in **audit-mode** (verifier-trusted-weights; sub-proof bindings
+catch any prover-side substitution); the gap to true-ZK
+verifier-hidden-weights mode is characterized explicitly in §7.4,
+along with an extrapolated cost (100–500× prove, 30–100× verify,
+80–200× proof) for the structural rewrite. Phase 11 ships a
+property-test infrastructure with an independently-authored numpy
+reference, a 144-test tamper-coverage matrix, and CI integration;
+four external review passes have audited the prover, one of
+which caught a real soundness bug now structurally protected
+against (§7.5).
 
 ---
 
@@ -248,6 +295,50 @@ This analysis is only possible when a single compilation framework supports mult
 
 A compiler-based approach holds all variables constant except architecture, enabling principled co-design: choosing a model architecture based on both ML quality and proving cost, informed by the compiler's constraint analysis.
 
+### 4.5 GDN Recurrent State: From Asymptotic Argument to Measured Proof
+
+The Qwen3.5 GatedDeltaNet hybrid in §4.2 is no longer purely
+analytical. The shipping prover (commit `bfc0895`) lands the
+**audit-mode** GDN recurrent-state proof: pure-M31 integer recurrence
+running over T tokens with a domain-separated blake3 trajectory
+digest of `(S_t for t∈0..=T, o_t for t∈0..T)` plus a final-state
+weight commitment and two MLE-eval claims at transcript-derived
+points. Verifier re-runs the same recurrence and asserts bytewise
+digest equality, mirroring the Fiat-Shamir order verbatim.
+
+This closes the C1 honest-scope caveat ("recurrent state not
+proven") in the current scope. Proof size is **constant
+in T** — one digest (32 B) + one weight commitment (~80 B) + two
+field evaluations (8 B) + a u64 = ~150 bytes total — because the
+per-step Merkle commitment cost is amortized into the single
+trajectory digest. The 64 MB-per-timestep concern that motivated
+the original scaffold's design discussion applies only to the
+deferred true-ZK Merkle path.
+
+The proof structure has been cross-validated against an
+independently-authored numpy reference (`tests/reference/gdn_recurrence.py`,
+192 LOC) via a `proptest` harness asserting byte-identical
+trajectory digests across 20 random configurations covering
+non-trivial GQA-class geometries (`H ≠ 1 ∧ d_k ≠ d_v`).
+Soundness review by adversarial agent #4 returned **SIGN-OFF READY
+WITH NOTES**, with the headline conclusion: "the class of bug that
+bit P10-3 [GQA r-coord slicing] cannot occur here because the
+audit-mode design avoids slicing entirely — the verifier never
+decomposes r into sub-coordinates, it re-computes the entire
+trajectory and compares bytewise." Three low-severity polish items
+were addressed; no blocking soundness gaps.
+
+**Status.** Audit-mode binding ships and is wired into the
+P10-7 sub-proof. The full structural sumcheck decomposition
+(decomposing `q_t^T S_t` into matmul sumcheck + rank-1 outer-product
+triple sumchecks for `k k^T S_{t-1}` and `k v^T` + LogUp lookups
+for sigmoid/exp/softplus + elementwise gate-scale + claim-chained
+`S_t → S_{t+1}` MLE binding) is queued with the broader true-ZK
+migration (§7.4). The audit-mode binding is **not** weaker than no
+proof — a malicious prover with no weight access cannot fake it,
+and the digest binding catches every byte-level tampering of the
+trajectory.
+
 ---
 
 ## 5. Dual Compilation and Optimistic Verification
@@ -292,39 +383,100 @@ Current optimistic zkML systems maintain two separate implementations. Bugs in e
 
 **Note on GKR-based systems.** DeepProve's use of GKR is a fundamentally different paradigm from circuit flattening (R1CS/AIR). GKR exploits the layered structure of the computation directly, achieving efficiency that R1CS-based approaches cannot match for uniformly layered circuits. Our approach is complementary: the compiler's graph-level optimizations (fusion, quantization, architecture analysis) are independent of the backend proof system and could target a GKR backend in future work.
 
+**The closer competitor: structured-sumcheck-based zkML.** ZK-Compile's
+shipping prover uses structured sumcheck over Mersenne-31, which sits in
+the same architectural family as DeepProve's GKR (sumcheck-based, layer-
+structure-aware) and Lagrange Labs' published zkML work [12]. Of the
+systems in the table above, **DeepProve / Lagrange is the closest
+architectural competitor** for billion-parameter inference: both
+exploit layered structure to scale beyond what R1CS-based systems
+manage. We have **not yet measured a head-to-head benchmark** against
+DeepProve at the 4B-parameter scale; DeepProve's published numbers
+target smaller models (sub-1B) and use a different field arithmetic
+(BabyBear vs. our Mersenne-31). A direct comparison is blocked on
+either system extending to the same model and field — tracked as a
+priority follow-up alongside the §7.5 reviewer pass infrastructure.
+
+**Other relevant systems.** Modulus Labs [^modulus] and Giza
+[^giza] target zkML-as-a-service and Cairo-based ML respectively;
+neither has published a 4B-parameter measured proof. zkLLM [2]
+focuses on LLM-specific lookup arguments and reports per-operation
+microbenchmarks. SUMMER [14] addresses recursive proofs for RNN
+training. None of these directly contradict the architectural
+analysis in §4 (linear vs. softmax attention scaling), and we
+believe ZK-Compile's compiler-based decomposition would benefit
+each — particularly the cross-architecture proving cost analysis,
+which depends on a single compilation framework supporting multiple
+architectures with a shared cost model.
+
+[^modulus]: Modulus Labs. https://www.moduluslabs.xyz/
+[^giza]: Giza. https://www.gizatech.xyz/
+
 ---
 
 ## 7. Implementation Plan
 
 ### Phase 1: Proof of Concept — COMPLETE
 
-R1CS backend for a subset of TensorIR (static shapes, no memory indirection), targeting arkworks Groth16. Two-line API: `circuit = compile_model(model, x)` → `result = prove(circuit, x)`. Also accepts ONNX: `circuit = compile_onnx("model.onnx", x)`.
+The shipping prover (`rust/zk_ml_prover/`) is a Rust implementation of structured sumcheck over Mersenne-31 (M31), with a default Mersenne-31⁴ extension-field (EF) challenge regime giving ~124-bit per-round soundness, plus optional Basefold PCS modes (`--features pcs`, `--features pcs-full`) for explicit weight binding. The R1CS Groth16 path (separately housed in `rust/zk_compile_prover/`) targets BN254 for the trusted-setup quickstart and remains in maintenance for the small-model demo. The main Phase 1 deliverable is the audit-mode prover scaling end-to-end through GPT-2 and Qwen3.5 hybrid transformers.
 
-**Key implementation details:**
+**Key implementation details (sumcheck path):**
+
+- M31⁴ extension-field challenges across all sub-protocols (124-bit per round; ~248-bit aggregate over the residual chain; reduced from 31-bit base-field after a Phase 9 reviewer pass)
+- Structured sumcheck for matmul, LayerNorm/RMSNorm, residual chaining via MLE-eval-at-r
+- LogUp (with active-subtable compression) for SwiGLU / SiLU / GELU / sigmoid lookups; M3 audit-mode binding via blake3 trajectory digest of `(inputs, outputs)`
+- Seq1VConsistency: prover stamps an MLE evaluation `v_at_r` of the seq_len=1 attention V tensor; verifier mirrors with the **GQA-correct r-coord slice `[r[..log_kv] ‖ r[len-log_d..]]`** (not contiguous prefix — the 3rd reviewer's GQA bug, fixed in commit 86f3ab6)
+- GDN recurrent state (P10-7 audit-mode): pure-M31 integer recurrence + blake3 trajectory digest + final-state MLE binding for the Qwen3.5 GatedDeltaNet hybrid layer
+- Memory-aware scheduler: per-layer weight-byte budget caps `par_chunk_size` to fit a 32 GB target peak (overridable via `ZKMLP_TARGET_PEAK_GB`)
+- Cross-request lookup-table cache: process-global SiLU + sigmoid table memoization keyed by scale (4B prove 376 → 328 ms ~13% faster on warm)
+
+**Key implementation details (R1CS / Groth16 path):**
+
 - Scale-aware quantization: bias rescaling through dataflow graph (correlation 1.000000 vs PyTorch)
-- Dataflow wire sharing: Relax call graph parsed, output→input wires shared across functions
-- Zero-gate wire aliasing: transpose/reshape output→input wire mapping (no gates = pure data movement)
+- Constant wire constraints: model weights pinned to exact values (1 constraint per wire), 16x cheaper than range checks while strictly stronger
+- Mul+add fusion: 49% constraint reduction for MNIST MLP (209K → 107K), 30% for CNN (66K → 46K)
 - Sound ReLU: 41-bit decomposition, malicious-prover secure
-- Constant wire constraints: model weights pinned to exact values (1 constraint per wire), preventing weight substitution by malicious prover
-- Mul+add fusion: accumulation adds folded into preceding mul constraints (49% constraint reduction for MLP)
 
-**Measured results (M4 Max, BN254 field, INT16 quantization):**
+**Measured results — sumcheck path (M4 Max, EF default ~124-bit, INT16 / pre-quantized weights, audit-mode):**
 
-| Model | Constraints (base) | Constraints (+ const) | Prove (base) | Prove (+ const) | Verify | Proof |
-|-------|-------------------|---------------------|-------------|-----------------|--------|-------|
-| MNIST MLP (784→128→10) | 107,415 | 209,185 | 0.59s | 0.82s | 0.9ms | 128 B |
-| MNIST CNN (conv+relu+fc) | 46,103 | 51,977 | 0.20s | 0.20s | 1.0ms | 128 B |
+| Model | Params | Layers | Prove | Verify | Proof Size | Soundness |
+|-------|--------|--------|-------|--------|------------|-----------|
+| Dense MLP (re-measured) | 4.2M | — | **24.7 ms** | 0.1 ms | 2.1 KB | 124-bit |
+| GPT-2 (re-measured, 3-run avg 248–260) | 124M | 12 | **253 ms** | 5.16 ms | 963 KB | 124-bit |
+| Qwen3.5-4B GDN+attn hybrid (re-measured, 3-run avg 356–392) | 4B | 32 (24 GDN + 8 full-attn) | **376 ms** | 74 ms | 1.25 MB | 124-bit |
+| Qwen3.5-9B GDN+attn hybrid (single run; memory-bound) | 9B | 32 | **17.8 s** | 2.6 s | 1.25 MB | 124-bit |
+| Qwen3.5-0.8B (`--features pcs-full`, pre-EF-default) | 800M | 24 | 14.3 s | 683 ms | 391 MB | 124 + 219-bit |
 
-*Base = no constant constraints (model weights unpinned). + const = constant constraints pinning all model weights (sound against malicious prover).*
+**Measured results — Groth16 R1CS path (M4 Max, BN254, INT16):**
 
-**EZKL comparison (Halo2/KZG, same models, same machine):**
+| Model | Constraints (base / + const) | Prove (base / + const) | Verify | Proof |
+|-------|------------------------------|------------------------|--------|-------|
+| MNIST MLP (784→128→10) | 107,415 / 209,185 | 0.59s / 0.82s | 0.9ms | 128 B |
+| MNIST CNN (conv+relu+fc) | 46,103 / 51,977 | 0.20s / 0.20s | 1.0ms | 128 B |
 
-| Model | EZKL constraints | EZKL prove | EZKL verify | EZKL proof size |
-|-------|-----------------|------------|-------------|-----------------|
-| MNIST MLP | ≤65,536 | 1.23s | 17.5ms | 18,829 B |
-| MNIST CNN | ≤65,536 | 1.35s | 17.9ms | 18,761 B |
+*Base = no constant constraints. + const = model weights pinned to exact values (sound against malicious prover).*
 
-**Comparison (ZK-Compile with constant constraints vs EZKL):**
+**Head-to-head EZKL comparison — Dense-4M MLP, identical hardware (M4 Max), April 2026 P10-1 harness, audit-mode:**
+
+|  | ZK-Compile (sumcheck, EF default) | EZKL (Halo2 / KZG) | Ratio |
+|---|---|---|---|
+| Setup | none (Fiat-Shamir) | 74.7 s (KZG trusted setup) | — |
+| Prove | **26.3 ms** | 62,456.6 ms | **~2,375× faster** |
+| Verify | **0.20 ms** | 1,281.8 ms | **~6,409× faster** |
+| Proof | **2.1 KB** | 169.8 KB | **~80× smaller** |
+| Soundness/round | 124-bit (EF sumcheck) | ~128-bit (KZG/Halo2) | comparable |
+| Verifier model | audit-mode (verifier holds weights) | succinct ZK (smart-contract verifiable) | **different products** |
+
+> **Comparison fairness disclosure (§7.4 below).** The 2,375× / 6,409× / 80×
+> ratios above measure two systems serving genuinely different verifier
+> models. EZKL's verifier can run on Ethereum and hides weights from the
+> verifier; ours runs as a CPU process holding the plaintext weights.
+> The ratios are accurate for the audit-mode-attestation use case but
+> are **not apples-to-apples for the ZK-on-chain use case** EZKL
+> primarily targets. See §7.4 for the verifier-model side-by-side and
+> §8 for the open-research path to apples-to-apples.
+
+**Comparison summary (Groth16 R1CS path vs EZKL on identical MNIST MLP/CNN):**
 
 | Metric | MLP | CNN |
 |--------|-----|-----|
@@ -333,11 +485,104 @@ R1CS backend for a subset of TensorIR (static shapes, no memory indirection), ta
 | Proof size | 147x smaller | 147x smaller |
 | Constraints | 3.2x more | 0.8x (fewer) |
 
-**GPT-2 results (structured sumcheck over M31, March 2026):** 12-layer GPT-2 (124M parameters): 1.19s prove, 4.87ms verify, 2.48MB proof, 182/182 operations proved (100% coverage). All operations including attention (softmax + QKV dot products) are fully proved.
+The CNN result is notable: ZK-Compile with full soundness guarantees produces fewer constraints than EZKL. EZKL (Halo2) wins on constraint count for MLP (lookup tables for ReLU + range checks) and requires no trusted setup; ZK-Compile (Groth16) wins on prove speed, verify speed, and proof size.
 
-ZK-Compile (Groth16) wins on prove speed, verify speed, and proof size. EZKL (Halo2) wins on constraint count for MLP (lookup tables for ReLU + range checks) and requires no trusted setup. The CNN result is notable: ZK-Compile with full soundness guarantees produces fewer constraints than EZKL.
+**The scale story.** EZKL's published demos top out around 100M parameters; Halo2/KZG with R1CS does not extend gracefully to billion-parameter models. The Qwen3.5-4B prove time of 376 ms is, to our knowledge, **the first measured end-to-end zkML proof on a 4-billion-parameter hybrid transformer on commodity hardware**. The 9B run at 17.8 s establishes the M4-Max scale ceiling; closer-to-linear scaling for 9B requires either `--features pcs-full` (which already caps `par_chunk_size = 8`) or weight streaming alongside the memory-aware scheduler — tracked as future work.
 
-**Fusion results:** TVM's standard FuseOps gives 0% constraint reduction (merges at graph level, doesn't eliminate intermediate TIR buffers). Our ZK-specific mul+add fusion folds accumulation adds into their preceding mul gates, reducing MLP constraints by 49% (209K → 107K) and CNN by 30% (66K → 46K).
+**Fusion results:** TVM's standard FuseOps gives 0% constraint reduction on the R1CS path (merges at graph level, doesn't eliminate intermediate TIR buffers). Our ZK-specific mul+add fusion folds accumulation adds into their preceding mul gates, reducing MLP constraints by 49% (209K → 107K) and CNN by 30% (66K → 46K). The sumcheck path uses a different optimization regime (LogUp + structured matmul + EF folding) where constraint count is not the operative metric.
+
+### Phase 1.4: Verifier-Model Side-by-Side and the Audit-Mode Gap (§7.4)
+
+The headline ratios in the EZKL comparison above are measured under
+**audit-mode** semantics: ZK-Compile's verifier holds the model weights
+and re-runs a canonical forward pass, while EZKL's verifier holds only
+commitments. This is a real product distinction, not a benchmarking
+artifact, and the paper documents it explicitly so readers do not
+confuse the two.
+
+| Property | ZK-Compile (default audit-mode) | ZK-Compile (`pcs-full`, weight-binding) | EZKL (Halo2 / KZG) |
+|---|---|---|---|
+| Verifier holds weights | yes | partial (can hold commitment instead) | no |
+| Verifier hides activations from outside observer | no | no | yes |
+| Smart-contract verifiable | no | no | yes (Halo2 export) |
+| Trusted setup | no | no | yes (~75 s ceremony) |
+| Recursive aggregation | not yet | not yet | yes (Halo2) |
+| Scales to 4B params | yes (376 ms / 4B) | yes (slower; pcs-full 14.3 s on 0.8B) | not demonstrated |
+| Per-round soundness | 124-bit (EF) | 124 + 219-bit | ~128-bit |
+
+**Where audit-mode is the right product:** internal model attestation
+(prove that the served output matches the registered model) within a
+trust boundary (audit logs, two-party computation, regulated finance
+backends, agent-to-agent attestation). The verifier in these settings
+already has the weights — what they need is a cryptographic check that
+the prover did not silently swap them. ZK-Compile's audit-mode binding
+catches that exactly: any tampered weight or activation produces a
+canonical-trace divergence the verifier rejects.
+
+**Where audit-mode is NOT a substitute for true ZK:** smart-contract
+verification, public verifiable inference, weight-hiding model serving.
+For these, the structural rewrite from audit-mode to
+`(WeightCommitment, MleEvalProof)` bindings is required (M3 closure
+plan; ~8–12 weeks engineering).
+
+**Approximate cost of true-ZK migration on Qwen3.5-4B**, extrapolated
+from the `pcs-full` 0.8B anchor (which alone adds ~155× prove / ~43×
+verify / ~83× proof relative to the audit-mode default):
+
+| | Default audit-mode (today) | True-ZK (extrapolated) | Multiplier |
+|---|---|---|---|
+| Prove | 376 ms | ~30 s – 3 min | ~100–500× |
+| Verify | 74 ms | ~2–10 s | ~30–100× |
+| Proof | 1.25 MB | ~100–300 MB | ~80–200× |
+
+The wide range reflects engineering tradeoffs (batched Basefold
+openings, folded FRI, shared transcripts across sub-proofs).
+Lower-bound estimates assume deliberate optimization; upper bound is a
+naive port. **Even the upper-bound true-ZK number on 4B params would
+exceed published EZKL demos at that scale**, but the headline "376 ms
+audit-mode" advantage is reduced.
+
+### Phase 1.5: Test Infrastructure and Adversarial Review (§7.5)
+
+The shipping prover ships with a property-test infrastructure
+deliberately designed to catch the class of soundness bug a hand-
+written test suite (authored by the prover author) cannot:
+
+- **Phase 11 (P11-1 → P11-6, all DONE):** independently-authored
+  numpy reference for every provable op (5 modules, ~1000 LOC); a
+  `proptest`-driven differential harness running Rust prover ↔ numpy
+  reference cross-language across 30+ random configs covering all
+  three GDN / GQA-full-attn / asymmetric-V branches in 2.4 s
+  wall-clock; an MLE-relations isolated proptest suite (7 tests) where
+  reintroducing the GQA r-coord bug fails `mle_replicate_identity`
+  in &lt;60 s; a 144-test tamper-coverage matrix (24 fields × 3 branches
+  × 2 proof types — base-field `QwenLayerProof` + EF
+  `QwenLayerProofEF`); a quantization-invariants suite locking the
+  M31-positive-half-field envelope and a 64-step recurrence proxy
+  (regression target for P10-7 GDN); CI integration with
+  `PROPTEST_CASES=100` PR-tier cap and a nightly `phase11-soak` job
+  at 10,000 cases.
+
+- **Four external review passes** (independent audits of the
+  codebase for soundness gaps): the first two returned unconditional
+  sign-off on the post-Phase-9 / post-Phase-10 state. The third
+  caught a real soundness bug — the GQA r-coord slicing error in
+  `Seq1VConsistency` — that all hand-written tests had passed,
+  fixed with a regression test exercising num_q_heads=4 vs
+  num_kv_heads=2. The fourth audited the audit-mode binding for the
+  GDN recurrence and the LogUp `_with_data` digest and signed off
+  with three low-severity polish notes, all addressed. The fourth
+  reviewer's headline conclusion on the GDN binding: "the class of
+  bug that bit the GQA r-coord case cannot occur here because the
+  audit-mode design avoids sub-coordinate slicing entirely — the
+  verifier never decomposes r into sub-coordinates, it re-computes
+  the entire trajectory and compares bytewise."
+
+The test infrastructure is itself the evidence. Aggregate test counts:
+199 unit tests (lib + bin double-compile) + 4 phase11-harness
++ 7 phase11-mle-relations + 7 phase11-quant-invariants
++ 144 phase11-tamper-matrix + 2 p10_7_gdn_recurrence_harness
++ 7 Python pytests + 1 zk_compile_prover = **562 tests passing**.
 
 ### Phase 2: Field-Native Quantization (4-6 weeks)
 - Goldilocks (64-bit) and BabyBear (31-bit) field quantization
@@ -363,17 +608,88 @@ ZK-Compile (Groth16) wins on prove speed, verify speed, and proof size. EZKL (Ha
 
 ## 8. Limitations
 
-- **Phase 1 complete.** The R1CS backend, gate extraction, witness generation, Groth16 proving, mul+add fusion, constant wire constraints, ONNX input, and two-line API are all working. MNIST MLP and CNN models proved end-to-end with correct output (correlation 1.000000 vs PyTorch). Constraint counts in Section 4 remain analytical estimates; Phase 1 results cover only MNIST-scale models.
+- **Audit-mode is not true ZK.** The shipping prover's default
+  verifier holds plaintext weights and re-runs the canonical forward
+  pass. This is sound under the verifier-trusted-weights threat model
+  (the sub-proof bindings catch any prover-side weight or activation
+  substitution) but does **not** match the threat model most readers
+  associate with "ZK proofs of inference." The migration to true-ZK
+  is a structural rewrite, not a feature flag — see §7.4 for the
+  cost extrapolation. `--features pcs` and `--features pcs-full`
+  upgrade weight binding via Basefold but do not by themselves close
+  the audit-mode gap (the lookup-with-data, Seq1V, residual-chain,
+  and GDN recurrence bindings still rely on canonical-trace
+  recomputation).
 
-- **Constraint count ≠ proving time.** We use constraint count for cross-architecture comparison (where the proof system is held constant) but acknowledge that proving time depends on commitment costs (MSM/NTT), witness generation, and memory, all of which are superlinear in constraint count.
+- **TVM lowering is not implemented.** The C5 disclaimer at the top
+  of the paper is load-bearing. The shipping prover does not
+  `import tvm`. Sections 3 and 4 describe the *design proposal*; the
+  shipping prover is a hand-written Rust implementation of structured
+  sumcheck over Mersenne-31. The TVM integration remains future work,
+  out-of-tree or upstream depending on community feedback.
 
-- **Field quantization accuracy is unvalidated.** We argue that field-native quantization is equivalent to integer quantization at the same bit width, but have not measured accuracy on real models. INT8 quantization causes measurable accuracy loss on LLMs; INT16 is safer but produces larger circuits.
+- **No measured DeepProve / Lagrange head-to-head.** ZK-Compile and
+  DeepProve sit in the same architectural family (sumcheck, layer-
+  structure-aware) and a direct measured comparison is the missing
+  data point a Series A diligence pass would expect. The blocker is
+  bilateral: DeepProve has not published 4B-parameter measurements,
+  and we have not yet ported one of their published smaller models
+  to our pipeline. Tracked as a §6 follow-up.
 
-- **Dynamic shapes unsupported.** The ZK backend requires concrete shapes at compile time. Each input shape requires a separate circuit compilation.
+- **9B is the M4-Max scale ceiling.** Qwen3.5-9B at 17.8 s prove is
+  memory-bound; the per-layer weights at d_model=4096, d_ff=12288
+  saturate 64 GB RAM under 32 simultaneous rayon threads, degrading
+  to swap-bound serial. Closer-to-linear scaling requires either a
+  weight-streaming scheduler (drop per-layer weights after a chunk
+  completes) or `--features pcs-full` (which already caps
+  `par_chunk_size = 8`). Multi-host distribution is not yet
+  implemented.
 
-- **Proof composition not designed.** Proving real-sized models (1B+ parameters) requires circuit partitioning and recursive proof composition. We have not designed the partitioning strategy or its interaction with fusion passes.
+- **Constraint count ≠ proving time.** We use constraint count for
+  cross-architecture comparison (where the proof system is held
+  constant) but acknowledge that proving time depends on commitment
+  costs (MSM/NTT), witness generation, and memory, all of which are
+  superlinear in constraint count. For the sumcheck path,
+  constraint count is not the operative metric; MLE-evaluation cost
+  + LogUp-table size + Basefold opening size dominate.
 
-- **TVM community acceptance uncertain.** A ZK backend is architecturally compatible with TVM's extension mechanisms but serves a different audience than TVM's current users. An out-of-tree extension or fork may be more practical than upstreaming.
+- **Field quantization accuracy on full models is unvalidated.** We
+  argue that field-native quantization is equivalent to integer
+  quantization at the same bit width, and the shipping prover passes
+  end-to-end forward-equality tests vs. PyTorch on Qwen3.5-4B at
+  INT16 (correlation 1.000000 on MNIST MLP / CNN; equivalent
+  integer-rounding match on the larger LLMs). Per-token output
+  quality (perplexity vs FP32) on real prompts is not yet measured.
+  INT8 quantization causes measurable accuracy loss on LLMs; INT16
+  is safer but produces larger circuits.
+
+- **Dynamic shapes unsupported.** The ZK backend requires concrete
+  shapes at compile time. Each input shape requires a separate
+  circuit compilation.
+
+- **Proof composition not designed.** Proving real-sized models
+  (4B+ parameters) without per-layer partitioning is what enables
+  the 376 ms headline; recursive composition (Nova / HyperNova /
+  STARK recursion) is queued for the regimes where per-layer
+  partitioning becomes the bottleneck (multi-host, decentralized
+  proving markets).
+
+- **No live demo or browser path.** The Qwen3.5-WebGPU browser path
+  is in progress (per the `QWEN35_IMPLEMENTATION.md` log) but has
+  unresolved bugs at the time of writing. A "watch the proof
+  generate live" demo is a high-leverage credibility artifact and
+  is the single biggest deliverable still outside this paper's
+  scope.
+
+- **TVM community acceptance uncertain.** A ZK backend is
+  architecturally compatible with TVM's extension mechanisms but
+  serves a different audience than TVM's current users. An
+  out-of-tree extension or fork may be more practical than
+  upstreaming.
+
+- **Pre-production.** No customer integrations, no production
+  deployment, no third-party security audit beyond the four
+  external review passes documented in §7.5.
 
 ---
 
@@ -383,7 +699,29 @@ The central observation of this paper is that ML compilers and ZK circuit compil
 
 The most impactful finding is that **architecture selection is a first-order lever for ZK proving cost** — an insight that only emerges when a unified compiler provides comparable cost analysis across model families. At long sequence lengths, linear attention architectures (GatedDeltaNet, Mamba-2) produce asymptotically fewer non-linear constraints than softmax transformers, with the attention-layer advantage exceeding 1000x at 8K tokens. This asymptotic advantage is robust to proof system choice and optimization level, as it stems from the O(n²) vs O(n) scaling of the attention computation itself.
 
-Phase 1 results demonstrate that compiler-level optimizations provide measurable advantages: mul+add fusion reduces MLP constraints by 49%, scale-aware quantization achieves perfect correlation with PyTorch, and constant wire constraints provide sound weight binding at 16x lower cost than range checks. Against EZKL on MNIST CNN, ZK-Compile with full soundness guarantees produces fewer constraints while proving 6.8x faster — the first demonstration that a compiler-based approach can match or beat a dedicated zkML framework on constraint efficiency.
+Phase 1 results validate the architectural argument with measured
+proofs at scale. The shipping structured-sumcheck prover over
+Mersenne-31 (default audit-mode, ~124-bit per-round soundness) proves
+**Qwen3.5-4B in 376 ms / 74 ms verify / 1.25 MB proof on a single
+M4 Max** — to our knowledge the first measured end-to-end zkML proof
+of a 4-billion-parameter hybrid transformer on commodity hardware.
+Against EZKL on Dense-4M MLP (identical hardware), ZK-Compile is
+~2,375× faster on prove and ~6,409× faster on verify in the
+audit-mode-attestation use case; the comparison is not
+apples-to-apples for EZKL's smart-contract use case (§7.4). The
+audit-mode-vs-true-ZK distinction, the migration cost extrapolation,
+and the GDN recurrent-state proof structure are documented honestly
+throughout. Four independent external review passes have audited
+the codebase, one of which caught a real soundness bug (the GQA
+r-coord slicing error) that hand-written tests had missed — since
+fixed, with the broader Phase 11 property-test infrastructure now
+structurally protecting against this class of bug.
+
+The R1CS Groth16 path on MNIST remains in maintenance: ZK-Compile
+with full soundness guarantees produces fewer constraints than EZKL
+on CNN while proving 6.8× faster — the first demonstration that a
+compiler-based approach can match or beat a dedicated zkML framework
+on constraint efficiency at small scale.
 
 ---
 

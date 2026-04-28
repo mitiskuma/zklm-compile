@@ -13,29 +13,73 @@ use crate::proving::weight_commitment::commit_weights_fast;
 
 type F = Mersenne31;
 
+/// SAFETY (E3a): caps for server preload phase. Match parser caps from
+/// protocol.rs. The Python orchestrator is trusted but bugs can still produce
+/// hostile-looking dims; these caps keep the prover process alive.
+const PRELOAD_MAX_WEIGHTS: u32 = 1 << 16;          // 65,536 — far above any model
+const PRELOAD_MAX_DIM: usize = 1 << 24;            // 16M
+const PRELOAD_MAX_NAME_LEN: usize = 1 << 12;       // 4 KiB — names are short
+const PRELOAD_MAX_ELEMENT_COUNT: usize = 1 << 30;  // 4 GiB at 4 B/elem
+
 pub(crate) fn run_server_mode(reader: &mut BufReader<io::Stdin>, writer: &mut BufWriter<io::Stdout>) {
+    if let Err(e) = run_server_mode_inner(reader, writer) {
+        eprintln!("  server: fatal error during preload — {}", e);
+        // Drain stdin briefly so the orchestrator notices the EPIPE rather than
+        // hanging on a half-written frame; then return cleanly so caller exits.
+        let _ = reader;
+    }
+}
+
+fn run_server_mode_inner(reader: &mut BufReader<io::Stdin>, writer: &mut BufWriter<io::Stdout>)
+    -> io::Result<()>
+{
     let t_preload = Instant::now();
 
     // Read preload header: num_weight_matrices
-    let num_weights = read_u32_from(reader);
+    let num_weights = read_u32_from_checked(reader)?;
+    if num_weights > PRELOAD_MAX_WEIGHTS {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("num_weights {} exceeds cap {}", num_weights, PRELOAD_MAX_WEIGHTS)));
+    }
     eprintln!("  server: preloading {} weight matrices", num_weights);
 
     let mut weights: HashMap<String, PreloadedLinear> = HashMap::new();
     for i in 0..num_weights {
         let t_w = Instant::now();
-        let name_len = read_u32_from(reader) as usize;
-        let mut name_buf = vec![0u8; name_len];
-        reader.read_exact(&mut name_buf)
-            .expect("IO error reading weight name during preload");
-        let name = String::from_utf8(name_buf).expect("invalid UTF-8 in weight name");
+        let name_len = read_u32_from_checked(reader)? as usize;
+        if name_len > PRELOAD_MAX_NAME_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("preload weight[{}] name_len {} exceeds cap {}",
+                    i, name_len, PRELOAD_MAX_NAME_LEN)));
+        }
+        let name_buf = read_exact_vec(reader, name_len)?;
+        let name = String::from_utf8(name_buf)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData,
+                format!("preload weight[{}] name not valid UTF-8", i)))?;
 
-        let m = read_u32_from(reader) as usize;
-        let n = read_u32_from(reader) as usize;
+        let m = read_u32_from_checked(reader)? as usize;
+        let n = read_u32_from_checked(reader)? as usize;
+        if m > PRELOAD_MAX_DIM || n > PRELOAD_MAX_DIM {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("preload weight[{}] '{}' dim ({}, {}) exceeds cap {}",
+                    i, name, m, n, PRELOAD_MAX_DIM)));
+        }
 
-        let total = m * n;
+        // SAFETY: checked_mul prevents `m * n` overflow on hostile dims;
+        // additional cap guards against OOM via huge legal-but-unreasonable dims.
+        let total = m.checked_mul(n)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
+                format!("preload weight[{}] '{}' m*n overflow ({} * {})",
+                    i, name, m, n)))?;
+        if total > PRELOAD_MAX_ELEMENT_COUNT {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("preload weight[{}] '{}' element count {} exceeds cap {}",
+                    i, name, total, PRELOAD_MAX_ELEMENT_COUNT)));
+        }
+
         let mut w_f = Vec::with_capacity(total);
         for _ in 0..total {
-            w_f.push(F::from_canonical_u32(read_u32_from(reader)));
+            w_f.push(F::from_canonical_u32(read_u32_from_checked(reader)?));
         }
 
         let commitment = commit_weights_fast(&w_f);
@@ -143,10 +187,21 @@ pub(crate) fn run_server_mode(reader: &mut BufReader<io::Stdin>, writer: &mut Bu
             Some(v)
         };
         // Bulk read: read count u32 values and transmute to F (for large weight matrices).
+        // SAFETY (E3a): use checked_mul on `count * 4` and saturating_sub on
+        // remaining-bytes so a hostile `count` cannot wrap or panic on subtraction.
         let safe_read_bulk_f = |payload: &[u8], pos: &mut usize, count: usize| -> Option<Vec<F>> {
-            let byte_len = count * 4;
-            if *pos + byte_len > payload.len() {
-                eprintln!("  server: malformed payload, unexpected end at offset {} (need {} bytes for bulk read)", *pos, byte_len);
+            let byte_len = match count.checked_mul(4) {
+                Some(v) => v,
+                None => {
+                    eprintln!("  server: malformed payload, count*4 overflow (count={})", count);
+                    return None;
+                }
+            };
+            if payload.len().saturating_sub(*pos) < byte_len {
+                eprintln!(
+                    "  server: malformed payload, unexpected end at offset {} (need {} bytes for bulk read)",
+                    *pos, byte_len,
+                );
                 return None;
             }
             let slice = &payload[*pos..*pos + byte_len];
@@ -358,24 +413,30 @@ pub(crate) fn run_server_mode(reader: &mut BufReader<io::Stdin>, writer: &mut Bu
                         });
                     }
                     14 => {
-                        // qwen_layer
+                        // qwen_layer (inline weights). v_num_heads/v_d_head added for asymmetric GDN.
                         let d_model = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let d_ff = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let num_q_heads = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let num_kv_heads = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let d_head = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
+                        let v_num_heads = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
+                        let v_d_head = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let silu_scale = try_read!(safe_read_i32(&payload, &mut pos));
                         let sigmoid_scale = try_read!(safe_read_i32(&payload, &mut pos));
 
                         let q_dim = num_q_heads * d_head;
-                        let kv_dim = num_kv_heads * d_head;
+                        let k_dim = num_kv_heads * d_head;
+                        let v_dim = v_num_heads * v_d_head;
+                        // Heuristic: GQA full-attn has q_heads != kv_heads (output q_dim).
+                        // GDN has q_heads == kv_heads (output v_dim).
+                        let attn_out_dim = if num_q_heads != num_kv_heads { q_dim } else { v_dim };
 
                         let norm1_gamma = try_read!(safe_read_bulk_f(&payload, &mut pos, d_model));
                         let w_q = try_read!(safe_read_bulk_f(&payload, &mut pos, q_dim * d_model));
-                        let w_k = try_read!(safe_read_bulk_f(&payload, &mut pos, kv_dim * d_model));
-                        let w_v = try_read!(safe_read_bulk_f(&payload, &mut pos, kv_dim * d_model));
-                        let w_o = try_read!(safe_read_bulk_f(&payload, &mut pos, d_model * q_dim));
-                        let w_g_proj = try_read!(safe_read_bulk_f(&payload, &mut pos, q_dim * d_model));
+                        let w_k = try_read!(safe_read_bulk_f(&payload, &mut pos, k_dim * d_model));
+                        let w_v = try_read!(safe_read_bulk_f(&payload, &mut pos, v_dim * d_model));
+                        let w_o = try_read!(safe_read_bulk_f(&payload, &mut pos, d_model * attn_out_dim));
+                        let w_g_proj = try_read!(safe_read_bulk_f(&payload, &mut pos, attn_out_dim * d_model));
                         let norm2_gamma = try_read!(safe_read_bulk_f(&payload, &mut pos, d_model));
                         let w_gate = try_read!(safe_read_bulk_f(&payload, &mut pos, d_ff * d_model));
                         let w_up = try_read!(safe_read_bulk_f(&payload, &mut pos, d_ff * d_model));
@@ -386,6 +447,7 @@ pub(crate) fn run_server_mode(reader: &mut BufReader<io::Stdin>, writer: &mut Bu
                             config: QwenLayerConfig {
                                 d_model, d_ff, num_q_heads, num_kv_heads, d_head,
                                 silu_scale, sigmoid_scale,
+                                v_num_heads, v_d_head,
                             },
                             weights: QwenLayerWeightData {
                                 norm1_gamma, w_q, w_k, w_v, w_o, w_g_proj,
@@ -394,12 +456,15 @@ pub(crate) fn run_server_mode(reader: &mut BufReader<io::Stdin>, writer: &mut Bu
                         });
                     }
                     15 => {
-                        // qwen_layer_ref: config + 10 weight name references
+                        // qwen_layer_ref: config + 10 weight name references.
+                        // Wire format adds v_num_heads/v_d_head after d_head for asymmetric GDN.
                         let d_model = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let d_ff = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let num_q_heads = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let num_kv_heads = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let d_head = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
+                        let v_num_heads = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
+                        let v_d_head = try_read!(safe_read_u32(&payload, &mut pos)) as usize;
                         let silu_scale = try_read!(safe_read_i32(&payload, &mut pos));
                         let sigmoid_scale = try_read!(safe_read_i32(&payload, &mut pos));
 
@@ -421,6 +486,7 @@ pub(crate) fn run_server_mode(reader: &mut BufReader<io::Stdin>, writer: &mut Bu
                             config: QwenLayerConfig {
                                 d_model, d_ff, num_q_heads, num_kv_heads, d_head,
                                 silu_scale, sigmoid_scale,
+                                v_num_heads, v_d_head,
                             },
                             weight_names,
                         });
@@ -833,6 +899,8 @@ pub(crate) fn run_server_mode(reader: &mut BufReader<io::Stdin>, writer: &mut Bu
             response.valid
         );
     }
+
+    Ok(())
 }
 
 #[allow(dead_code)]

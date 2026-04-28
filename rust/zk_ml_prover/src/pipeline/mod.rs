@@ -781,6 +781,7 @@ mod tests {
             n_layers: 1, vocab_size: 0,
             norm_type: crate::transformer::NormType::RMSNorm,
             activation: crate::transformer::ActivationType::SwiGLU,
+            v_num_heads: 0, v_d_head: 0,
         };
         let wd = make_llama_layer_weight_data(d_model, d_ff, num_q_heads, num_kv_heads, d_head);
         let weights = crate::transformer::LlamaLayerWeights {
